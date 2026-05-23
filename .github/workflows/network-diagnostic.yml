@@ -78,17 +78,116 @@ jobs:
           echo "=== [8] TLS handshake to salonboard.com:443 ==="
           timeout 20 openssl s_client -connect salonboard.com:443 -servername salonboard.com </dev/null 2>&1 | head -5 || echo "❌ TLS handshake failed"
 
+      - name: Setup Python and Playwright
+        run: |
+          python3 -m pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium
+
+      - name: '[9] Test salonboard.com with Playwright (full Chromium)'
+        run: |
+          cat > /tmp/pw_test.py << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+          import time, sys, traceback
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/130.0.0.0 Safari/537.36")
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=[
+                      "--no-sandbox",
+                      "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--lang=ja-JP",
+                  ],
+              )
+              context = browser.new_context(
+                  locale="ja-JP",
+                  timezone_id="Asia/Tokyo",
+                  user_agent=UA,
+                  viewport={"width": 1280, "height": 800},
+                  extra_http_headers={
+                      "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+                  },
+              )
+              # Hide webdriver flag (common Akamai check)
+              context.add_init_script(
+                  "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+              )
+              page = context.new_page()
+              start = time.time()
+              status_code = None
+              try:
+                  print("Navigating to https://salonboard.com/login/ ...")
+                  response = page.goto(
+                      "https://salonboard.com/login/",
+                      timeout=45000,
+                      wait_until="domcontentloaded",
+                  )
+                  elapsed = time.time() - start
+                  status_code = response.status if response else None
+                  print(f"✅ HTTP {status_code}, took {elapsed:.2f}s")
+                  print(f"Final URL: {page.url}")
+                  print(f"Title: {page.title()!r}")
+                  content = page.content()
+                  print(f"Body length: {len(content)} chars")
+                  hits = []
+                  for kw in ["ログイン", "パスワード", "サロンボード", "ID", "salon"]:
+                      if kw in content:
+                          hits.append(kw)
+                  print(f"Login-form keywords found: {hits}")
+                  if status_code and status_code < 400 and hits:
+                      print("🎉 RESULT: Playwright successfully reached salonboard.com login page.")
+                  elif status_code and status_code >= 400:
+                      print(f"⚠️  RESULT: Server responded {status_code} — Akamai application-layer block.")
+                  else:
+                      print("⚠️  RESULT: Reached the page but login form not detected; check screenshot.")
+                  page.screenshot(path="/tmp/salonboard_pw.png", full_page=True)
+                  print("Screenshot saved: /tmp/salonboard_pw.png")
+              except Exception as e:
+                  elapsed = time.time() - start
+                  print(f"❌ {type(e).__name__} after {elapsed:.2f}s: {e}")
+                  traceback.print_exc()
+                  try:
+                      page.screenshot(path="/tmp/salonboard_pw_error.png", full_page=True)
+                      print("Error screenshot saved.")
+                  except Exception:
+                      pass
+                  sys.exit(0)  # don't fail the job — diagnostic is informational
+              finally:
+                  browser.close()
+          PYEOF
+          python3 /tmp/pw_test.py
+
+      - name: Upload Playwright screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-diagnostic
+          path: |
+            /tmp/salonboard_pw.png
+            /tmp/salonboard_pw_error.png
+          if-no-files-found: ignore
+
       - name: Summary
         run: |
           echo ""
           echo "================================="
           echo "📊 SUMMARY"
           echo "================================="
-          echo "If [1][2][3] (Japanese sites) succeeded but [4][5][6] (salonboard) all timed out,"
-          echo "→ IP block by salonboard.com is CONFIRMED."
+          echo "Diagnosis based on the steps above:"
           echo ""
-          echo "If [7] DNS resolved but [8] TLS failed,"
-          echo "→ Firewall/IP-level block at network layer."
+          echo "  • [1][2][3] OK + [4][5][6] all timeout + [8] TLS OK"
+          echo "    → Akamai Bot Manager 'silent drop' at HTTP layer (TLS works but bot judged)."
           echo ""
-          echo "If [4] returned HTTP 403/429,"
-          echo "→ Application-layer block (still blocked, but different mechanism)."
+          echo "  • [9] Playwright SUCCESS (HTTP 200, login form detected)"
+          echo "    → 🎉 GitHub Actions can run the bot via real Chromium — NO Japan IP needed!"
+          echo "       The previous failure was due to using \`requests\` (Python HTTP lib)"
+          echo "       in the http_preflight step, which Akamai blocks by TLS fingerprint."
+          echo "       Fix: remove the requests preflight; rely on Playwright only."
+          echo ""
+          echo "  • [9] Playwright timeout / error / HTTP 403"
+          echo "    → Even real Chromium is blocked from US IP. Japan IP required."
+          echo "       → Move to Oracle Cloud Tokyo Free / VPS / Windows PC."
