@@ -292,10 +292,27 @@ def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
     raise RuntimeError(f"Login: unexpected status {r.status}")
 
 
-def is_logged_in_after(relay: SalonBoardRelay, probe_url: str = "https://salonboard.com/KLP/blog/blog/") -> bool:
+# 認証されていない場合に <title> に出現する文字列。
+# 認証済みページでは "SALON BOARD : ブログ編集 入力" や "SALON BOARD : 予約一覧" のように
+# 機能名が入る。これらは「未認証」または「エラー」を示すタイトル。
+_UNAUTH_TITLE_KEYWORDS = (
+    "ログイン",        # /login/ の login page
+    "エラー",          # SALON BOARD : エラー (URLなし、セッション切れ等)
+    "Session",         # tomcat 系セッション切れ
+)
+
+
+def is_logged_in_after(
+    relay: SalonBoardRelay,
+    probe_url: str = "https://salonboard.com/KLP/blog/blog/",
+) -> bool:
     """ログイン後、保護領域にアクセスできるか確認。
 
-    認証成功なら sc_data に storeid が入っている。
+    判定方法（信頼度の高い順）:
+      1. 200 以外 / login URL への redirect → ❌ 未認証
+      2. <title> に「ログイン」「エラー」等のキーワード → ❌ 未認証
+      3. body にログインフォーム（id=idPasswordInputForm 等）が含まれる → ❌ 未認証
+      4. それ以外（保護領域のページが返っている）→ ✅ 認証済
     """
     log.info("Auth probe: GET %s", probe_url)
     try:
@@ -313,13 +330,25 @@ def is_logged_in_after(relay: SalonBoardRelay, probe_url: str = "https://salonbo
         log.warning("Probe returned non-200 status → likely not authenticated")
         return False
 
-    storeid, userid = _parse_login_state(r.body_text)
-    if storeid:
-        log.info("✅ Probe confirms authenticated state: storeid=%s", storeid)
-        return True
-    log.warning(
-        "Probe body has no storeid in sc_data → likely not authenticated. Title hint: %s",
-        (re.search(r"<title>([^<]+)</title>", r.body_text) or [None, "(no title)"])[1]
-        if re.search(r"<title>([^<]+)</title>", r.body_text) else "(no title)",
-    )
-    return False
+    body = r.body_text
+    title_match = re.search(r"<title>([^<]+)</title>", body)
+    title = title_match.group(1).strip() if title_match else "(no title)"
+
+    # 未認証を示すタイトル
+    for kw in _UNAUTH_TITLE_KEYWORDS:
+        if kw in title:
+            log.warning(
+                "Probe title indicates unauthenticated/error state: %r (matched %r)",
+                title, kw,
+            )
+            return False
+
+    # body にログインフォームの構造が含まれていれば未認証
+    if 'idPasswordInputForm' in body or (
+        'name="userId"' in body and 'name="password"' in body
+    ):
+        log.warning("Probe body contains login form structure → unauthenticated")
+        return False
+
+    log.info("✅ Probe confirms authenticated state: title=%r", title)
+    return True
