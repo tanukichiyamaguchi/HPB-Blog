@@ -84,6 +84,65 @@ def test_build_image_prompt_lash_lift_maintains_base_cluster():
     assert "基本通り維持" in prompt
 
 
+def test_build_image_prompt_uses_amateur_iphone_style():
+    """User requirement: 素人がiPhoneで撮影したような画質。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "iPhone" in prompt or "スマートフォン" in prompt
+    assert "素人" in prompt
+    # Studio-grade language should be explicitly negated, not promoted
+    assert "プロのスタジオ撮影や雑誌写真のような完璧さは避け" in prompt
+    # Should NOT contain the old "高解像度・フォトグラフィック" upgrade language
+    assert "高解像度" not in prompt
+    assert "フォトグラフィック" not in prompt
+
+
+def test_build_image_prompt_no_excessive_retouch():
+    """Amateur style: no heavy retouching."""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "レタッチ" in prompt
+    assert "美肌" in prompt  # "極端な美肌加工なし" etc.
+
+
+def test_build_image_prompt_varies_by_seed():
+    """Different seeds should yield different prompts (diversity)."""
+    import random
+
+    p1 = build_image_prompt("テーマ", "眉毛WAX", rng=random.Random(1))
+    p2 = build_image_prompt("テーマ", "眉毛WAX", rng=random.Random(2))
+    assert p1 != p2, "Same prompt across different seeds — diversity broken"
+
+
+def test_build_image_prompt_eye_diversity_across_seeds():
+    """Across many seeds, multiple distinct eye types should appear."""
+    import random
+
+    seen = set()
+    for seed in range(50):
+        prompt = build_image_prompt("テーマ", "眉毛WAX", rng=random.Random(seed))
+        for line in prompt.splitlines():
+            if line.startswith("目元タイプ"):
+                seen.add(line.strip())
+                break
+    assert len(seen) >= 5, f"Only {len(seen)} unique eye types in 50 trials"
+
+
+def test_build_image_prompt_includes_eye_and_skin_type_labels():
+    """Each prompt should label the sampled eye and skin attributes."""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "目元タイプ：" in prompt
+    assert "肌タイプ：" in prompt
+    assert "眉の毛量ベース：" in prompt
+
+
+def test_build_image_prompt_same_seed_reproducible():
+    """Same seed → same prompt (test determinism)."""
+    import random
+
+    p1 = build_image_prompt("テーマA", "眉毛WAX", rng=random.Random(42))
+    p2 = build_image_prompt("テーマA", "眉毛WAX", rng=random.Random(42))
+    assert p1 == p2
+
+
 def test_build_image_prompt_rejects_forbidden_words():
     # Building a prompt with forbidden words shouldn't happen via the public API,
     # but the validation should catch it if someone modifies _MENU_VISUAL_HINTS.
