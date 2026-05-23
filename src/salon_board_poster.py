@@ -1,19 +1,29 @@
 """Salon Board automation via Playwright.
 
-Phase 3 scope: login → blog new → fill (title/body/image) → save AS DRAFT.
-Phase 5 scope: same flow but sets publish datetime and saves as SCHEDULED post.
+Real flow (inspected from user screenshots 2026-05-23):
+1. https://salonboard.com/login/  → ID + PW + ログイン
+2. https://salonboard.com/KLP/blog/blog/  (direct URL, no menu nav needed)
+3. Form fields on the new-post page:
+   - 投稿者 (select): rotates by date through momo / aoi / ケイト 蒲田西口店
+   - カテゴリ (select): default おすすめメニュー
+   - タイトル (input): 全角25文字以下
+   - 本文 (textarea): 全角1000文字以下
+   - 画像アップロード (button → modal → file input → 登録する)
+   - クーポン (button → modal, optional — TODO for Phase 4 polish)
+   - 予約投稿 (radio: 設定しない | 設定する + date/time pickers)
+4. 確認する → preview page
+5. On preview: 下書き保存 (Phase 3) or 予約する (Phase 5)
 
-Selectors are best-effort with multiple fallbacks. Each step writes a screenshot
-to ``screenshots/`` so failures can be diagnosed and selectors refined iteratively.
-URLs and selector sets can be overridden via environment variables for fast
-turn-around between GitHub Actions runs.
+Selectors carry multiple fallbacks; each step writes a screenshot to
+``screenshots/`` so failures can be diagnosed and refined iteratively.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -36,106 +46,149 @@ SALON_BOARD_LOGIN_URL = _env_url(
     "SALON_BOARD_LOGIN_URL",
     "https://salonboard.com/login/",
 )
-SALON_BOARD_BLOG_LIST_URL = _env_url(
-    "SALON_BOARD_BLOG_LIST_URL",
-    "https://salonboard.com/KLP/blog/list/",
+SALON_BOARD_BLOG_NEW_URL = _env_url(
+    "SALON_BOARD_BLOG_NEW_URL",
+    "https://salonboard.com/KLP/blog/blog/",
 )
 
 DEFAULT_TIMEOUT_MS = int(os.environ.get("SB_TIMEOUT_MS", "30000"))
 PER_SELECTOR_TIMEOUT_MS = int(os.environ.get("SB_PER_SELECTOR_TIMEOUT_MS", "2500"))
 
 
+# Daily poster rotation (one per day). pome(非掲載) is intentionally excluded.
+POSTER_ROTATION: tuple[str, ...] = (
+    "momo",
+    "aoi",
+    "ケイト 蒲田西口店",
+)
+
+# Salon Board category options (visible labels):
+#   プライベート / サロンのNEWS / おすすめメニュー / おすすめデザイン / ビューティー
+# Our blog is always menu-focused → use おすすめメニュー by default.
+DEFAULT_CATEGORY = "おすすめメニュー"
+
+
+def get_poster_for_date(d: date) -> str:
+    """Return the rotating poster name for the given date (deterministic)."""
+    return POSTER_ROTATION[d.toordinal() % len(POSTER_ROTATION)]
+
+
 # --- Selector candidate sets (order = priority) ----------------------------- #
 
 LOGIN_ID_SELECTORS: tuple[str, ...] = (
-    "#userId",
+    "#idPasswordInputId",
     "input[name='userId']",
     "input[name='loginId']",
     "input[name='id']",
     "input[type='text']:visible",
 )
 LOGIN_PW_SELECTORS: tuple[str, ...] = (
-    "#password",
+    "#idPasswordInputPassword",
     "input[name='password']",
     "input[type='password']:visible",
 )
 LOGIN_SUBMIT_SELECTORS: tuple[str, ...] = (
-    "button[type='submit']",
-    "input[type='submit']",
-    "button:has-text('ログイン')",
-    "input[value='ログイン']",
-    "a:has-text('ログイン')",
+    "a.common-CNCcommon__primaryBtn:has-text('ログイン')",
+    "a:text-is('ログイン')",
+    "button:text-is('ログイン')",
+    "input[type='submit'][value='ログイン']",
+    "button:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない'))",
 )
-BLOG_NEW_BUTTON_SELECTORS: tuple[str, ...] = (
-    "a:has-text('新規投稿')",
-    "a:has-text('新規作成')",
-    "button:has-text('新規投稿')",
-    "a:has-text('ブログ投稿')",
-    "a:has-text('新規ブログ')",
+
+POSTER_SELECT_SELECTORS: tuple[str, ...] = (
+    "select[name='posterId']",
+    "select[name='poster']",
+    "select[name='blogPoster']",
+    "select[name='posterCd']",
+)
+CATEGORY_SELECT_SELECTORS: tuple[str, ...] = (
+    "select[name='category']",
+    "select[name='categoryCd']",
+    "select[name='blogCategory']",
 )
 TITLE_INPUT_SELECTORS: tuple[str, ...] = (
     "input[name='title']",
-    "#title",
-    "input[placeholder*='タイトル']",
+    "input[name='blogTitle']",
+    "input#title",
 )
 BODY_TEXTAREA_SELECTORS: tuple[str, ...] = (
-    "textarea[name='content']",
     "textarea[name='body']",
+    "textarea[name='content']",
     "textarea[name='blogBody']",
-    "#body",
-    "#content",
-    "textarea:visible",
+    "textarea[name='blogContent']",
 )
-IMAGE_INPUT_SELECTORS: tuple[str, ...] = (
-    "input[type='file'][name*='image']",
-    "input[type='file'][name*='picture']",
+IMAGE_UPLOAD_OPEN_SELECTORS: tuple[str, ...] = (
+    "input[type='button'][value='画像アップロード']",
+    "button:has-text('画像アップロード')",
+    "a:has-text('画像アップロード')",
+)
+MODAL_FILE_INPUT_SELECTORS: tuple[str, ...] = (
+    "input[type='file']:visible",
     "input[type='file']",
 )
-DRAFT_SAVE_SELECTORS: tuple[str, ...] = (
-    "button:has-text('下書き保存')",
-    "input[value='下書き保存']",
-    "a:has-text('下書き保存')",
-    "button:has-text('下書き')",
-    "input[value*='下書き']",
+MODAL_REGISTER_SELECTORS: tuple[str, ...] = (
+    "button:has-text('登録する')",
+    "input[type='button'][value='登録する']",
+    "input[type='submit'][value='登録する']",
+    "a:has-text('登録する')",
 )
-SCHEDULE_SAVE_SELECTORS: tuple[str, ...] = (
-    "button:has-text('予約投稿')",
-    "input[value='予約投稿']",
-    "button:has-text('予約')",
-    "input[value='予約']",
-    "button:has-text('投稿予約')",
-    "a:has-text('予約投稿')",
+
+# 予約投稿
+SCHEDULE_RADIO_NO_SELECTORS: tuple[str, ...] = (
+    "label:has-text('設定しない')",
+    "input[type='radio'][value='0']",
 )
-PUBLISH_DATE_SELECTORS: tuple[str, ...] = (
+SCHEDULE_RADIO_YES_SELECTORS: tuple[str, ...] = (
+    "label:has-text('設定する')",
+    "input[type='radio'][value='1']",
+    "input[type='radio'][value='reserved']",
+)
+SCHEDULE_DATE_SELECTORS: tuple[str, ...] = (
+    "input[name='reservedDate']",
+    "input[name='reserveDate']",
     "input[type='date']",
-    "input[name*='publish_date']",
-    "input[name*='postDate']",
-    "input[name*='reserveDate']",
-    "input[name*='publishDate']",
 )
-PUBLISH_HOUR_SELECTORS: tuple[str, ...] = (
-    "select[name*='hour']",
-    "select[name*='publish_hour']",
-    "select[name*='postHour']",
-    "select[name*='reserveHour']",
+SCHEDULE_HOUR_SELECTORS: tuple[str, ...] = (
+    "select[name='reservedHour']",
+    "select[name='reserveHour']",
+    "select[name='hour']",
 )
-PUBLISH_MINUTE_SELECTORS: tuple[str, ...] = (
-    "select[name*='minute']",
-    "select[name*='publish_minute']",
-    "select[name*='postMinute']",
-    "select[name*='reserveMinute']",
+SCHEDULE_MINUTE_SELECTORS: tuple[str, ...] = (
+    "select[name='reservedMinute']",
+    "select[name='reserveMinute']",
+    "select[name='minute']",
 )
-SCHEDULE_RADIO_SELECTORS: tuple[str, ...] = (
-    "input[type='radio'][value='reserve']",
-    "input[type='radio'][value='schedule']",
-    "label:has-text('予約投稿')",
-    "input[type='radio'][value='2']",
+
+CONFIRM_BUTTON_SELECTORS: tuple[str, ...] = (
+    "input[type='button'][value='確認する']",
+    "input[type='submit'][value='確認する']",
+    "button:has-text('確認する')",
+    "a:has-text('確認する')",
 )
-CONFIRM_DIALOG_SELECTORS: tuple[str, ...] = (
-    "button:has-text('はい')",
-    "button:has-text('OK')",
-    "button:has-text('確定')",
-    "button:has-text('保存')",
+
+# Buttons on the preview / confirmation page
+PREVIEW_DRAFT_SAVE_SELECTORS: tuple[str, ...] = (
+    "button:has-text('下書き保存')",
+    "input[type='button'][value='下書き保存']",
+    "input[type='submit'][value='下書き保存']",
+    "a:has-text('下書き保存')",
+)
+PREVIEW_SCHEDULE_POST_SELECTORS: tuple[str, ...] = (
+    "button:has-text('予約投稿')",
+    "button:has-text('予約する')",
+    "input[type='button'][value='予約投稿']",
+    "input[type='button'][value='予約する']",
+    "input[type='submit'][value='予約投稿']",
+    "input[type='submit'][value='予約する']",
+    "a:has-text('予約投稿')",
+    "a:has-text('予約する')",
+)
+
+# Optional: dismiss the "ログインでお困りですか？" helper panel if it blocks anything.
+LOGIN_HELP_DISMISS_SELECTORS: tuple[str, ...] = (
+    "button[aria-label='閉じる']",
+    ".help-popup button.close",
+    "div.help-popup .close",
 )
 
 
@@ -169,7 +222,7 @@ def _safe_filename(label: str) -> str:
 
 
 class SalonBoardPoster:
-    """Drives the Salon Board UI to save a blog post as draft."""
+    """Drives the Salon Board UI to save a blog post as draft or scheduled."""
 
     def __init__(
         self,
@@ -237,6 +290,29 @@ class SalonBoardPoster:
         log.warning("Could not click %s with any of %d selectors", label, len(selectors))
         return False
 
+    def _try_select(
+        self,
+        page: Page,
+        selectors: Sequence[str],
+        label_text: str,
+        debug_label: str,
+    ) -> bool:
+        """Select a dropdown option by its visible label text."""
+        for sel in selectors:
+            try:
+                page.locator(sel).first.select_option(
+                    label=label_text, timeout=self.per_selector_timeout_ms,
+                )
+                log.info("Selected %s=%s via selector: %s", debug_label, label_text, sel)
+                return True
+            except Exception as e:  # noqa: BLE001
+                log.debug("Select %s=%s with %s failed: %s", debug_label, label_text, sel, e)
+        log.warning(
+            "Could not select %s=%s with any of %d selectors",
+            debug_label, label_text, len(selectors),
+        )
+        return False
+
     def _try_set_files(
         self,
         page: Page,
@@ -264,8 +340,19 @@ class SalonBoardPoster:
 
     # ----- public entry ----- #
 
-    def post_as_draft(self, title: str, body: str, image_path: Path) -> PostResult:
-        return self._post(title, body, image_path, scheduled_dt=None)
+    def post_as_draft(
+        self,
+        title: str,
+        body: str,
+        image_path: Path,
+        *,
+        poster: str | None = None,
+        category: str = DEFAULT_CATEGORY,
+    ) -> PostResult:
+        return self._post(
+            title, body, image_path, scheduled_dt=None,
+            poster=poster, category=category,
+        )
 
     def post_as_scheduled(
         self,
@@ -273,8 +360,14 @@ class SalonBoardPoster:
         body: str,
         image_path: Path,
         scheduled_dt: datetime,
+        *,
+        poster: str | None = None,
+        category: str = DEFAULT_CATEGORY,
     ) -> PostResult:
-        return self._post(title, body, image_path, scheduled_dt=scheduled_dt)
+        return self._post(
+            title, body, image_path, scheduled_dt=scheduled_dt,
+            poster=poster, category=category,
+        )
 
     def _post(
         self,
@@ -282,6 +375,8 @@ class SalonBoardPoster:
         body: str,
         image_path: Path,
         scheduled_dt: datetime | None,
+        poster: str | None,
+        category: str,
     ) -> PostResult:
         if not title:
             raise ValueError("title is required")
@@ -290,6 +385,16 @@ class SalonBoardPoster:
         image_path = Path(image_path)
         if not image_path.exists():
             raise FileNotFoundError(f"image_path does not exist: {image_path}")
+
+        if poster is None:
+            poster = get_poster_for_date(date.today())
+
+        log.info(
+            "Posting: poster=%s, category=%s, scheduled=%s, title=%r",
+            poster, category,
+            scheduled_dt.isoformat() if scheduled_dt else "(draft)",
+            title,
+        )
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -308,12 +413,16 @@ class SalonBoardPoster:
 
                 self._login(page)
                 self._navigate_to_blog_new(page)
-                self._fill_blog_form(page, title, body, image_path)
-                if scheduled_dt is None:
-                    final_url = self._save_as_draft(page)
-                else:
-                    self._set_scheduled_datetime(page, scheduled_dt)
-                    final_url = self._save_as_scheduled(page)
+                self._fill_form(
+                    page,
+                    title=title,
+                    body=body,
+                    image_path=image_path,
+                    poster=poster,
+                    category=category,
+                    scheduled_dt=scheduled_dt,
+                )
+                final_url = self._submit_and_finalize(page, scheduled_dt)
 
                 return PostResult(
                     success=True,
@@ -354,103 +463,131 @@ class SalonBoardPoster:
             raise RuntimeError(f"Login likely failed; still on {page.url}")
 
     def _navigate_to_blog_new(self, page: Page) -> None:
-        log.info("Going to blog list: %s", SALON_BOARD_BLOG_LIST_URL)
-        page.goto(SALON_BOARD_BLOG_LIST_URL, wait_until="domcontentloaded")
+        log.info("Going to blog new form: %s", SALON_BOARD_BLOG_NEW_URL)
+        page.goto(SALON_BOARD_BLOG_NEW_URL, wait_until="domcontentloaded")
         self._wait_idle(page)
-        self._screenshot(page, "04_blog_list")
+        self._screenshot(page, "04_blog_new_form")
 
-        # Clicking the "new post" link/button is best-effort: the list page may
-        # already contain the form, or the link may be on a sub-page.
-        if not self._try_click(page, BLOG_NEW_BUTTON_SELECTORS, "blog_new"):
-            log.warning("No 'new post' button found; assuming form is already accessible")
-        self._wait_idle(page)
-        self._screenshot(page, "05_blog_new_form")
-
-    def _fill_blog_form(
+    def _fill_form(
         self,
         page: Page,
+        *,
         title: str,
         body: str,
         image_path: Path,
+        poster: str,
+        category: str,
+        scheduled_dt: datetime | None,
     ) -> None:
         log.info("Filling form: title_len=%d body_len=%d", len(title), len(body))
 
+        # 投稿者
+        if not self._try_select(page, POSTER_SELECT_SELECTORS, poster, "poster"):
+            log.warning("Failed to select poster=%s; continuing", poster)
+        self._screenshot(page, "05_poster_selected")
+
+        # カテゴリ
+        if not self._try_select(page, CATEGORY_SELECT_SELECTORS, category, "category"):
+            log.warning("Failed to select category=%s; continuing", category)
+        self._screenshot(page, "06_category_selected")
+
+        # タイトル
         if not self._try_fill(page, TITLE_INPUT_SELECTORS, title, "title"):
             raise RuntimeError("Could not locate title input")
+
+        # 本文
         if not self._try_fill(page, BODY_TEXTAREA_SELECTORS, body, "body"):
             raise RuntimeError("Could not locate body textarea")
-        self._screenshot(page, "06_form_text")
+        self._screenshot(page, "07_text_filled")
 
-        if not self._try_set_files(page, IMAGE_INPUT_SELECTORS, image_path, "image"):
-            log.warning("Image upload failed; saving draft without image")
+        # 画像アップロード (modal)
+        self._upload_image(page, image_path)
+        self._screenshot(page, "09_after_image_upload")
+
+        # 予約投稿
+        if scheduled_dt is not None:
+            self._set_scheduled_datetime(page, scheduled_dt)
+            self._screenshot(page, "10_schedule_set")
+
+    def _upload_image(self, page: Page, image_path: Path) -> None:
+        log.info("Uploading image: %s", image_path)
+        # Open the modal
+        if not self._try_click(page, IMAGE_UPLOAD_OPEN_SELECTORS, "image_upload_open"):
+            log.warning("Could not find 画像アップロード button; trying direct file input")
+        # Give the modal a moment to render
+        try:
+            page.wait_for_timeout(800)
+        except Exception:  # noqa: BLE001
+            pass
+        self._screenshot(page, "08_image_upload_modal")
+
+        if not self._try_set_files(page, MODAL_FILE_INPUT_SELECTORS, image_path, "image_file"):
+            log.warning("Could not set image file via any input")
+            return
+        # Wait briefly for any client-side processing / preview
+        try:
+            page.wait_for_timeout(2500)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Click 登録する on the modal
+        if not self._try_click(page, MODAL_REGISTER_SELECTORS, "modal_register"):
+            log.warning("Could not click 登録する on image modal")
         try:
             page.wait_for_timeout(1500)
         except Exception:  # noqa: BLE001
             pass
-        self._screenshot(page, "07_form_image")
-
-    def _save_as_draft(self, page: Page) -> str | None:
-        log.info("Clicking draft-save button")
-        if not self._try_click(page, DRAFT_SAVE_SELECTORS, "draft_save"):
-            raise RuntimeError("Could not locate draft-save button")
-        self._wait_idle(page)
-        self._screenshot(page, "08_after_draft_save")
-
-        # Optional confirmation dialog
-        if self._try_click(page, CONFIRM_DIALOG_SELECTORS, "confirm_dialog"):
-            self._wait_idle(page)
-            self._screenshot(page, "09_after_confirm")
-
-        return page.url
 
     def _set_scheduled_datetime(self, page: Page, scheduled_dt: datetime) -> None:
-        """Select 予約投稿 mode and set publish date/time. Phase 5 — selectors TBD."""
         log.info("Setting scheduled datetime: %s", scheduled_dt.isoformat())
+        # Click 設定する radio (or its label)
+        if not self._try_click(page, SCHEDULE_RADIO_YES_SELECTORS, "schedule_radio_yes"):
+            log.warning("Could not click 設定する radio")
 
-        # Toggle to schedule mode (radio / tab)
-        self._try_click(page, SCHEDULE_RADIO_SELECTORS, "schedule_radio")
-        self._screenshot(page, "08_schedule_mode_selected")
+        # Try multiple date formats — Salon Board may use /, -, or yyyy/m/d
+        date_str_candidates = (
+            scheduled_dt.strftime("%Y/%m/%d"),
+            scheduled_dt.strftime("%Y-%m-%d"),
+            scheduled_dt.strftime("%Y%m%d"),
+        )
+        date_filled = False
+        for cand in date_str_candidates:
+            if self._try_fill(page, SCHEDULE_DATE_SELECTORS, cand, f"schedule_date({cand})"):
+                date_filled = True
+                break
+        if not date_filled:
+            log.warning("Could not fill scheduled date")
 
-        date_str = scheduled_dt.strftime("%Y-%m-%d")
+        # Hour / minute dropdowns (often 0-padded "08", "15")
         hour_str = f"{scheduled_dt.hour:02d}"
         minute_str = f"{scheduled_dt.minute:02d}"
+        if not self._try_select(page, SCHEDULE_HOUR_SELECTORS, hour_str, "schedule_hour"):
+            log.warning("Could not select scheduled hour")
+        if not self._try_select(page, SCHEDULE_MINUTE_SELECTORS, minute_str, "schedule_minute"):
+            log.warning("Could not select scheduled minute")
 
-        if not self._try_fill(page, PUBLISH_DATE_SELECTORS, date_str, "publish_date"):
-            log.warning("Could not set publish_date; may need different selector")
-
-        for sel in PUBLISH_HOUR_SELECTORS:
-            try:
-                page.locator(sel).first.select_option(
-                    value=hour_str, timeout=self.per_selector_timeout_ms,
-                )
-                log.info("Selected hour=%s via %s", hour_str, sel)
-                break
-            except Exception as e:  # noqa: BLE001
-                log.debug("Hour select %s failed: %s", sel, e)
-
-        for sel in PUBLISH_MINUTE_SELECTORS:
-            try:
-                page.locator(sel).first.select_option(
-                    value=minute_str, timeout=self.per_selector_timeout_ms,
-                )
-                log.info("Selected minute=%s via %s", minute_str, sel)
-                break
-            except Exception as e:  # noqa: BLE001
-                log.debug("Minute select %s failed: %s", sel, e)
-
-        self._screenshot(page, "09_schedule_datetime_set")
-
-    def _save_as_scheduled(self, page: Page) -> str | None:
-        log.info("Clicking scheduled-save button")
-        if not self._try_click(page, SCHEDULE_SAVE_SELECTORS, "schedule_save"):
-            raise RuntimeError("Could not locate schedule-save button")
+    def _submit_and_finalize(
+        self,
+        page: Page,
+        scheduled_dt: datetime | None,
+    ) -> str | None:
+        log.info("Clicking 確認する")
+        if not self._try_click(page, CONFIRM_BUTTON_SELECTORS, "confirm_button"):
+            raise RuntimeError("Could not locate 確認する button on the form")
         self._wait_idle(page)
-        self._screenshot(page, "10_after_schedule_save")
+        self._screenshot(page, "11_preview_page")
 
-        if self._try_click(page, CONFIRM_DIALOG_SELECTORS, "confirm_dialog"):
-            self._wait_idle(page)
-            self._screenshot(page, "11_after_confirm")
-
+        # On the preview page, click the final action button
+        if scheduled_dt is None:
+            log.info("Clicking 下書き保存 on preview")
+            if not self._try_click(page, PREVIEW_DRAFT_SAVE_SELECTORS, "preview_draft_save"):
+                raise RuntimeError("Could not locate 下書き保存 on preview page")
+        else:
+            log.info("Clicking 予約投稿 on preview")
+            if not self._try_click(page, PREVIEW_SCHEDULE_POST_SELECTORS, "preview_schedule_post"):
+                raise RuntimeError("Could not locate 予約投稿/予約する on preview page")
+        self._wait_idle(page)
+        self._screenshot(page, "12_after_finalize")
         return page.url
 
 
@@ -472,11 +609,15 @@ def post_blog_as_draft(
     body: str,
     image_path: Path,
     *,
+    poster: str | None = None,
+    category: str = DEFAULT_CATEGORY,
     headless: bool = True,
 ) -> PostResult:
     user_id, password = _require_credentials()
-    poster = SalonBoardPoster(user_id, password, headless=headless)
-    return poster.post_as_draft(title, body, image_path)
+    poster_obj = SalonBoardPoster(user_id, password, headless=headless)
+    return poster_obj.post_as_draft(
+        title, body, image_path, poster=poster, category=category,
+    )
 
 
 def post_blog_scheduled(
@@ -485,8 +626,13 @@ def post_blog_scheduled(
     image_path: Path,
     scheduled_dt: datetime,
     *,
+    poster: str | None = None,
+    category: str = DEFAULT_CATEGORY,
     headless: bool = True,
 ) -> PostResult:
     user_id, password = _require_credentials()
-    poster = SalonBoardPoster(user_id, password, headless=headless)
-    return poster.post_as_scheduled(title, body, image_path, scheduled_dt)
+    poster_obj = SalonBoardPoster(user_id, password, headless=headless)
+    return poster_obj.post_as_scheduled(
+        title, body, image_path, scheduled_dt,
+        poster=poster, category=category,
+    )

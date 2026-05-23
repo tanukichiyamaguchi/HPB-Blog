@@ -130,19 +130,33 @@ def run_generation(now: datetime | None = None) -> dict[str, Any]:
 def run_salon_board(generation: dict[str, Any], mode: str, now: datetime) -> dict[str, Any]:
     """Post the generated content to Salon Board (draft or schedule)."""
     # Lazy import so unit tests don't require Playwright to be installed at module level.
-    from src.salon_board_poster import post_blog_as_draft, post_blog_scheduled
+    from src.salon_board_poster import (
+        DEFAULT_CATEGORY,
+        get_poster_for_date,
+        post_blog_as_draft,
+        post_blog_scheduled,
+    )
 
     log = logging.getLogger("hpb-blog.main")
     blog = generation["blog"]
     image_path = Path(generation["image_path"])
+    poster = get_poster_for_date(now.date())
+    category = DEFAULT_CATEGORY
+    log.info("Salon Board params: poster=%s, category=%s", poster, category)
 
     if mode == "draft":
         log.info("=== Salon Board: DRAFT mode ===")
-        result = post_blog_as_draft(blog.title, blog.body, image_path, headless=True)
+        result = post_blog_as_draft(
+            blog.title, blog.body, image_path,
+            poster=poster, category=category, headless=True,
+        )
     elif mode == "schedule":
         publish_at = compute_next_publish_dt(now)
         log.info("=== Salon Board: SCHEDULE mode (publish_at=%s) ===", publish_at.isoformat())
-        result = post_blog_scheduled(blog.title, blog.body, image_path, publish_at, headless=True)
+        result = post_blog_scheduled(
+            blog.title, blog.body, image_path, publish_at,
+            poster=poster, category=category, headless=True,
+        )
     else:
         raise ValueError(f"Unknown salon-board mode: {mode!r}")
 
