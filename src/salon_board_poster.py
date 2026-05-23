@@ -16,17 +16,23 @@ Real flow (inspected from user screenshots 2026-05-23):
 
 Selectors carry multiple fallbacks; each step writes a screenshot to
 ``screenshots/`` so failures can be diagnosed and refined iteratively.
+
+GitHub Actions hardening:
+- HTTP pre-flight to log whether salonboard.com is reachable at all
+- Anti-bot-detection browser flags / user-agent / navigator.webdriver hiding
+- Progressive page-load strategy: domcontentloaded → commit → wait_for_selector
+- Bounded screenshot timeout with viewport fallback
 """
 from __future__ import annotations
 
 import logging
 import os
-import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+import requests
 from playwright.sync_api import (
     Page,
     sync_playwright,
@@ -52,7 +58,17 @@ SALON_BOARD_BLOG_NEW_URL = _env_url(
 )
 
 DEFAULT_TIMEOUT_MS = int(os.environ.get("SB_TIMEOUT_MS", "30000"))
+NAVIGATION_TIMEOUT_MS = int(os.environ.get("SB_NAV_TIMEOUT_MS", "90000"))
 PER_SELECTOR_TIMEOUT_MS = int(os.environ.get("SB_PER_SELECTOR_TIMEOUT_MS", "2500"))
+SCREENSHOT_TIMEOUT_MS = int(os.environ.get("SB_SCREENSHOT_TIMEOUT_MS", "15000"))
+
+# Modern Chrome on macOS user-agent — Salon Board is browser-only and may
+# refuse the default Playwright UA.
+DEFAULT_USER_AGENT = os.environ.get(
+    "SB_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+)
 
 
 # Daily poster rotation (one per day). pome(非掲載) is intentionally excluded.
@@ -218,6 +234,57 @@ def _safe_filename(label: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in label) or "step"
 
 
+def http_preflight(url: str = SALON_BOARD_LOGIN_URL, timeout_s: int = 15) -> dict[str, Any]:
+    """Best-effort raw HTTP probe.
+
+    Useful to differentiate geographic / network blocks (request never returns or
+    returns non-200) from browser-only bot detection (request returns 200 but
+    Playwright can't load page).
+    """
+    summary: dict[str, Any] = {"url": url}
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout_s,
+            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "ja-JP,ja;q=0.9"},
+            allow_redirects=True,
+        )
+        summary.update(
+            ok=True,
+            status_code=resp.status_code,
+            content_length=len(resp.content),
+            final_url=resp.url,
+            server=resp.headers.get("server", ""),
+        )
+        log.info(
+            "HTTP preflight: status=%s len=%d final=%s server=%s",
+            resp.status_code, len(resp.content), resp.url, resp.headers.get("server", ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        summary.update(ok=False, error=f"{type(e).__name__}: {e}")
+        log.warning("HTTP preflight failed: %s", e)
+    return summary
+
+
+# Init script to soften the most obvious headless/Playwright fingerprints.
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en'] });
+Object.defineProperty(navigator, 'plugins', {
+  get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }],
+});
+window.chrome = window.chrome || { runtime: {} };
+const originalQuery = navigator.permissions && navigator.permissions.query;
+if (originalQuery) {
+  navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(parameters)
+  );
+}
+"""
+
+
 # --- Poster ---------------------------------------------------------------- #
 
 
@@ -252,13 +319,64 @@ class SalonBoardPoster:
         self._step += 1
         name = f"{self._step:02d}_{_safe_filename(label)}.png"
         path = self.screenshots_dir / name
-        try:
-            page.screenshot(path=str(path), full_page=True)
-            self._screenshots.append(path)
-            log.info("Screenshot: %s", path)
-        except Exception as e:  # noqa: BLE001
-            log.warning("Screenshot failed for %s: %s", label, e)
+        # Try full-page first, then viewport-only as fallback so a stuck page
+        # doesn't bury the diagnostic with another timeout.
+        for kwargs in (
+            {"full_page": True, "animations": "disabled", "timeout": SCREENSHOT_TIMEOUT_MS},
+            {"full_page": False, "animations": "disabled", "timeout": 5000},
+        ):
+            try:
+                page.screenshot(path=str(path), **kwargs)
+                self._screenshots.append(path)
+                log.info("Screenshot: %s (%s)", path, "full" if kwargs["full_page"] else "viewport")
+                return path
+            except Exception as e:  # noqa: BLE001
+                log.warning("Screenshot %s failed (%s): %s", label, kwargs, e)
         return path
+
+    # ----- navigation with progressive fallback ----- #
+
+    def _navigate(
+        self,
+        page: Page,
+        url: str,
+        label: str,
+        *,
+        wait_for_selectors: Sequence[str] | None = None,
+    ) -> None:
+        """Navigate with: domcontentloaded → commit → wait_for_selector fallback."""
+        # Attempt 1: full DOMContentLoaded
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            log.info("Navigated to %s (%s) via domcontentloaded", url, label)
+            return
+        except PWTimeout:
+            log.warning(
+                "domcontentloaded timed out for %s after %dms; retrying with commit",
+                label, NAVIGATION_TIMEOUT_MS,
+            )
+
+        # Attempt 2: commit-only (just URL change). Some pages stall on a hung
+        # subresource; this gets us into the page so we can poll for selectors.
+        try:
+            page.goto(url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+            log.info("Navigated to %s (%s) via commit", url, label)
+        except PWTimeout as e:
+            log.error("commit navigation also failed for %s: %s", label, e)
+            raise
+
+        # Attempt 3: explicitly wait for an expected selector if provided
+        if wait_for_selectors:
+            for sel in wait_for_selectors:
+                try:
+                    page.locator(sel).first.wait_for(
+                        state="visible", timeout=NAVIGATION_TIMEOUT_MS,
+                    )
+                    log.info("Selector %s appeared after commit-only navigation", sel)
+                    return
+                except PWTimeout:
+                    log.debug("wait_for %s timed out; trying next", sel)
+            log.warning("None of %d expected selectors appeared after commit-only nav", len(wait_for_selectors))
 
     # ----- selector tries (auto-wait via Playwright timeout) ----- #
 
@@ -396,10 +514,21 @@ class SalonBoardPoster:
             title,
         )
 
+        # HTTP preflight: log connectivity / status from the runner's IP.
+        # If this fails or returns non-200, the issue is upstream of Playwright.
+        http_preflight()
+
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=self.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    # Reduce headless/automation detection
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--lang=ja-JP",
+                ],
             )
             page: Page | None = None
             try:
@@ -407,9 +536,14 @@ class SalonBoardPoster:
                     locale="ja-JP",
                     timezone_id="Asia/Tokyo",
                     viewport={"width": 1280, "height": 800},
+                    user_agent=DEFAULT_USER_AGENT,
+                    extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5"},
                 )
+                # Hide common automation fingerprints
+                context.add_init_script(_STEALTH_INIT_SCRIPT)
                 page = context.new_page()
                 page.set_default_timeout(self.timeout_ms)
+                page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
 
                 self._login(page)
                 self._navigate_to_blog_new(page)
@@ -445,7 +579,10 @@ class SalonBoardPoster:
 
     def _login(self, page: Page) -> None:
         log.info("Loading login: %s", SALON_BOARD_LOGIN_URL)
-        page.goto(SALON_BOARD_LOGIN_URL, wait_until="domcontentloaded")
+        self._navigate(
+            page, SALON_BOARD_LOGIN_URL, "login_page",
+            wait_for_selectors=LOGIN_ID_SELECTORS,
+        )
         self._screenshot(page, "01_login_page")
 
         if not self._try_fill(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
@@ -464,7 +601,10 @@ class SalonBoardPoster:
 
     def _navigate_to_blog_new(self, page: Page) -> None:
         log.info("Going to blog new form: %s", SALON_BOARD_BLOG_NEW_URL)
-        page.goto(SALON_BOARD_BLOG_NEW_URL, wait_until="domcontentloaded")
+        self._navigate(
+            page, SALON_BOARD_BLOG_NEW_URL, "blog_new_form",
+            wait_for_selectors=TITLE_INPUT_SELECTORS,
+        )
         self._wait_idle(page)
         self._screenshot(page, "04_blog_new_form")
 
