@@ -9,7 +9,13 @@ from typing import Any
 
 from anthropic import Anthropic
 
-from src.config import BLOG_PROMPT_PATH, CLAUDE_MAX_TOKENS_BLOG, CLAUDE_MODEL
+from src.config import (
+    BLOG_PROMPT_PATH,
+    CLAUDE_MAX_TOKENS_BLOG,
+    CLAUDE_MODEL,
+    SALON_SIGNATURE,
+    SIGNATURE_HORIZONTAL_RULE,
+)
 from src.utils import read_text, retry
 
 log = logging.getLogger(__name__)
@@ -77,6 +83,25 @@ def _parse_keywords(text: str) -> list[str]:
     return out
 
 
+def ensure_signature(body: str) -> str:
+    """Strip any partial signature the LLM may have produced and append the canonical one.
+
+    The LLM sometimes truncates the signature (only the header line and store name,
+    missing address/hours/hashtags). To guarantee a complete signature, we cut the body
+    at the first horizontal-rule line and append the full canonical signature.
+    """
+    body = body.rstrip()
+    lines = body.splitlines()
+    truncate_idx: int | None = None
+    for i, line in enumerate(lines):
+        if SIGNATURE_HORIZONTAL_RULE in line:
+            truncate_idx = i
+            break
+    if truncate_idx is not None:
+        body = "\n".join(lines[:truncate_idx]).rstrip()
+    return body + "\n\n" + SALON_SIGNATURE
+
+
 def parse_blog(raw: str) -> BlogPost:
     """Robustly extract title/keywords/body from the structured Claude output."""
     raw = raw.strip()
@@ -88,6 +113,8 @@ def parse_blog(raw: str) -> BlogPost:
     if not body:
         # Fallback: if structure is missing, treat everything after the last header as body
         body = raw
+
+    body = ensure_signature(body)
 
     return BlogPost(title=title, keywords=keywords, body=body, raw=raw)
 

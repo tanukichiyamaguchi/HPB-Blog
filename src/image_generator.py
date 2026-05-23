@@ -24,10 +24,23 @@ class ImageResult:
 
 
 _MENU_VISUAL_HINTS: dict[str, str] = {
-    "眉毛WAX": "美しく整った眉のクローズアップ、ナチュラルなアーチ",
-    "眉毛スタイリング": "上品で整った眉のスタイル参考、ナチュラルメイク",
-    "まつげパーマ": "美しくカールしたまつげ、上向きの目元",
-    "ラッシュリフト": "ナチュラルに立ち上がったまつげ、目元クローズアップ",
+    "眉毛WAX": (
+        "産毛まで丁寧に整えられたナチュラルな眉、自然なアーチ、"
+        "毛流れが整い濃すぎない上品な仕上がり"
+    ),
+    "眉毛スタイリング": (
+        "毛流れが整えられた上品なナチュラルブロウ、骨格に沿った自然なライン、"
+        "アイブロウメイクを引き立てるベース"
+    ),
+    "まつげパーマ": (
+        "上向きに美しくカールしたまつげ、毛先がランダムに集まって"
+        "束感（クラスター感・たばかん）が出たナチュラルで立体的な仕上がり、"
+        "目元がぱっちりと際立つ自然な印象"
+    ),
+    "ラッシュリフト": (
+        "根元から自然に立ち上がったまつげ、リフトアップ効果で目元が明るく開いた印象、"
+        "束感は控えめで毛が均一に上向きの自然なリフト"
+    ),
 }
 
 
@@ -35,16 +48,28 @@ _FORBIDDEN_WORDS = ("ビフォーアフター", "ビフォー", "アフター", 
 
 
 def build_image_prompt(theme: str, menu_focus: str) -> str:
-    """Build a natural-language image prompt. Forbids before/after wording."""
-    menu_hint = _MENU_VISUAL_HINTS.get(menu_focus, "美しい目元のサロンスタイル参考")
+    """Build a natural-language image prompt for Gemini image generation.
+
+    Composition requirements (all mandatory):
+      - Persona: Japanese woman in her late 20s
+      - Frontal view (両目が正面、首/肩のひねりなし)
+      - Tight crop on EYES + EYEBROWS only — no nose, mouth, hair, forehead, ears
+      - White / off-white solid background
+      - Photorealistic style
+    """
+    menu_hint = _MENU_VISUAL_HINTS.get(menu_focus, "ナチュラルで美しい目元のサロンスタイル")
     prompt = (
-        "リアルな日本人女性の写真。"
-        f"{menu_hint}。"
-        f"テーマ：{theme}。"
-        "目元周辺のクローズアップ、自然光で明るく清潔感のある雰囲気。"
-        "背景は白系の単色で、シンプルでミニマル。"
-        "メイクは控えめでナチュラル。サロンスタイルの参考イメージとして、"
-        "高品質・高解像度・写真リアルな仕上がり。"
+        "ペルソナ：20代後半（27〜29歳）の日本人女性。\n"
+        "構図：顔を正面に向けたクローズアップ、両目と眉だけが画面中央にタイトに収まる。\n"
+        "厳格なトリミング指示：眉の少し上から目の下のごく一部までだけを写す。"
+        "鼻・口・頬・顎・耳・髪・額・首・肩は一切フレーム内に入れないこと。"
+        "横顔・斜めアングル・俯瞰・あおりは禁止、視線はカメラ正面。\n"
+        f"施術スタイルの仕上がり：{menu_hint}。\n"
+        f"テーマ：{theme}。\n"
+        "ライティング：柔らかな自然光、明るく清潔感のあるサロン撮影。\n"
+        "背景：白〜オフホワイトの単色無地、シンプルでミニマル。\n"
+        "メイク：控えめでナチュラル、肌は素肌感のある美しい質感。\n"
+        "スタイル：写真リアル、高解像度、フォトグラフィック、サロンスタイルの参考イメージ。"
     )
     lowered = prompt.lower()
     for w in _FORBIDDEN_WORDS:

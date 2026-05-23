@@ -25,6 +25,44 @@ def test_build_image_prompt_handles_unknown_menu():
     assert "日本人女性" in prompt
 
 
+def test_build_image_prompt_specifies_late_20s_persona():
+    """User requirement: 20代後半女性のペルソナ。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "20代後半" in prompt
+
+
+def test_build_image_prompt_specifies_frontal_view():
+    """User requirement: 正面からの画像。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "正面" in prompt
+    # Forbidden angle words appear only inside negative-instruction sentences
+    assert "横顔・斜めアングル・俯瞰・あおりは禁止" in prompt
+
+
+def test_build_image_prompt_excludes_nose_hair_etc():
+    """User requirement: 鼻や髪は写さず、目元のみにトリミング。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    # The negative-instruction sentence must list every excluded body part
+    for forbidden_part in ("鼻", "口", "頬", "耳", "髪", "額", "首"):
+        assert forbidden_part in prompt, f"missing exclusion for {forbidden_part}"
+    assert "フレーム内に入れない" in prompt
+
+
+def test_build_image_prompt_lash_perm_emphasizes_cluster():
+    """User requirement: まつげパーマは束感を意識。"""
+    prompt = build_image_prompt("初夏のまつげケア", "まつげパーマ")
+    assert "束感" in prompt
+    assert "クラスター" in prompt
+
+
+def test_build_image_prompt_lash_lift_avoids_cluster_emphasis():
+    """Lash lift differs from perm: natural lift, no cluster emphasis."""
+    prompt = build_image_prompt("ラッシュリフト紹介", "ラッシュリフト")
+    assert "リフト" in prompt
+    # Lash-lift hint should not promote 束感 (only lash-perm does)
+    assert "束感は控えめ" in prompt
+
+
 def test_build_image_prompt_rejects_forbidden_words():
     # Building a prompt with forbidden words shouldn't happen via the public API,
     # but the validation should catch it if someone modifies _MENU_VISUAL_HINTS.

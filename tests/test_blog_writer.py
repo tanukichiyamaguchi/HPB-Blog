@@ -7,9 +7,11 @@ from src.blog_writer import (
     BlogPost,
     _parse_keywords,
     _parse_sections,
+    ensure_signature,
     generate_blog,
     parse_blog,
 )
+from src.config import SALON_SIGNATURE
 
 
 SAMPLE_OUTPUT = """---
@@ -127,6 +129,71 @@ def test_generate_blog_rejects_empty_theme():
         generate_blog("")
     with pytest.raises(ValueError):
         generate_blog("   ")
+
+
+def test_ensure_signature_appends_when_missing():
+    body = "本文です。\n素敵な眉に整えましょう。"
+    out = ensure_signature(body)
+    assert out.endswith(SALON_SIGNATURE)
+    assert "本文です。" in out
+    assert "◆住所〒144-0051" in out
+    assert "#蒲田駅西口" in out
+
+
+def test_ensure_signature_strips_partial_and_appends_full():
+    """LLM-truncated signature (only header) should be stripped and replaced with full."""
+    body = (
+        "本文の内容。\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "KATEstageLASH(ケイトステージラッシュ) 蒲田西口店\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    out = ensure_signature(body)
+    # Body content preserved
+    assert "本文の内容。" in out
+    # Full signature present
+    assert "◆住所〒144-0051" in out
+    assert "◆営業時間9:00~20:00" in out
+    assert "#蒲田駅西口" in out
+    # Only one set of address lines (no duplicate)
+    assert out.count("◆住所〒144-0051") == 1
+    assert out.count("KATEstageLASH(ケイトステージラッシュ) 蒲田西口店") == 1
+
+
+def test_ensure_signature_idempotent_for_full_signature():
+    body = "本文。\n\n" + SALON_SIGNATURE
+    out = ensure_signature(body)
+    # Address should appear exactly once
+    assert out.count("◆住所〒144-0051") == 1
+    assert out.count("KATEstageLASH(ケイトステージラッシュ) 蒲田西口店") == 1
+    # Body still intact
+    assert "本文。" in out
+
+
+def test_ensure_signature_empty_body():
+    out = ensure_signature("")
+    assert SALON_SIGNATURE in out
+
+
+def test_parse_blog_always_emits_full_signature():
+    """End-to-end: parse_blog output must end with the canonical signature."""
+    raw_with_partial = """◆タイトル：
+タイトル例
+
+◆使用キーワード：
+蒲田、眉毛
+
+◆本文：
+本文の内容。
+
+━━━━━━━━━━━━━━━━━━━━━━━
+KATEstageLASH(ケイトステージラッシュ) 蒲田西口店
+━━━━━━━━━━━━━━━━━━━━━━━
+"""
+    post = parse_blog(raw_with_partial)
+    assert "◆住所〒144-0051" in post.body
+    assert "#蒲田駅西口" in post.body
+    assert post.body.count("◆住所〒144-0051") == 1
 
 
 def test_generate_blog_raises_on_empty_response(monkeypatch, tmp_path):
