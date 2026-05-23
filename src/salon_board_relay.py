@@ -214,6 +214,31 @@ SALON_BOARD_BLOG_CONFIRM_URL = "https://salonboard.com/KLP/blog/blog/confirm"
 # Discovered: the "登録・反映予約する" button (id="reflect") JS posts here with just
 # 2 fields: the new TOKEN from the confirm response + the unchanged storeIdForMultipleTabCheck.
 SALON_BOARD_BLOG_REFLECT_URL = "https://salonboard.com/KLP/blog/blog/doReflectComplete"
+# KLP top page. Visiting this after login establishes the KLP-area session state
+# that some KLP/blog endpoints expect (Salon Board / Struts session is partly
+# constructed by visiting top-level area pages, not just by login).
+SALON_BOARD_KLP_TOP_URL = "https://salonboard.com/KLP/top/"
+# Blog list page. Browser users naturally pass through it before reaching the
+# new-post form; visiting it lets Salon Board populate any per-feature session
+# state needed for confirm/doReflectComplete.
+SALON_BOARD_BLOG_LIST_URL = "https://salonboard.com/KLP/blog/"
+
+
+# Realistic browser request headers, used for HTML navigation POSTs/GETs
+# to make our relay requests look like Firefox 133 (which we already advertise
+# in User-Agent via the PHP relay).
+_BROWSER_HTML_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+}
 
 
 # Staff IDs (verified from the blog edit form select options)
@@ -598,18 +623,35 @@ def submit_blog(
     # 観測された送信値は "W001414182," のように末尾カンマ込み。空なら空文字。
     unpublish_field = (",".join(unpublish_list) + ",") if unpublish_list else ""
 
+    # ----- Step 0: warm up KLP-area session by walking the natural path -----
+    # Browser users go login → /KLP/top/ → /KLP/blog/ → /KLP/blog/blog/ (new post).
+    # Skipping the intermediate pages causes Salon Board's confirm endpoint to
+    # reject the POST with the generic "KPCL030V02 / 操作しなおしてください" error
+    # (Struts session not fully initialized for the KLP/blog area).
+    for warmup_url in (SALON_BOARD_KLP_TOP_URL, SALON_BOARD_BLOG_LIST_URL):
+        log.info("Submit blog [0/4]: warm-up GET %s", warmup_url)
+        wr = relay.get(warmup_url, headers=_BROWSER_HTML_HEADERS)
+        log.info(
+            "  → HTTP %d (%d bytes); cookies now: %s",
+            wr.status, len(wr.body_bytes), sorted(relay.cookies.keys()),
+        )
+
     # ----- Step 1: GET input form (CSRF + storeIdForMultipleTabCheck) -----
     log.info("Submit blog [1/4]: GET %s", SALON_BOARD_BLOG_NEW_URL)
     r = relay.get(
         SALON_BOARD_BLOG_NEW_URL,
-        headers={"Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5"},
+        headers={
+            **_BROWSER_HTML_HEADERS,
+            "Referer": SALON_BOARD_BLOG_LIST_URL,
+        },
     )
     if r.status != 200:
         raise RuntimeError(f"Blog form load failed: HTTP {r.status}")
+    _dump_debug_body("form_get", r.body_text)
     csrf_in, tab_in = _parse_form_tokens(r.body_text)
     log.info(
-        "  Initial form tokens: csrf=%s..., tab=%s...",
-        csrf_in[:8], tab_in[:8],
+        "  Initial form tokens: csrf=%s..., tab=%s...; cookies: %s",
+        csrf_in[:8], tab_in[:8], sorted(relay.cookies.keys()),
     )
 
     # ----- Step 2: Upload images sequentially -----
@@ -652,12 +694,16 @@ def submit_blog(
         SALON_BOARD_BLOG_CONFIRM_URL,
         data=confirm_data,
         headers={
-            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            **_BROWSER_HTML_HEADERS,
             "Origin": "https://salonboard.com",
             "Referer": SALON_BOARD_BLOG_NEW_URL,
             "Content-Type": "application/x-www-form-urlencoded",
         },
         follow_redirects=False,
+    )
+    log.info(
+        "  → HTTP %d, %d bytes, %.2fs; cookies now: %s",
+        r.status, len(r.body_bytes), r.elapsed_seconds, sorted(relay.cookies.keys()),
     )
     if r.status != 200:
         _dump_debug_body("confirm_failed", r.body_text)
@@ -709,7 +755,7 @@ def submit_blog(
             "storeIdForMultipleTabCheck": tab_new,
         },
         headers={
-            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            **_BROWSER_HTML_HEADERS,
             "Origin": "https://salonboard.com",
             "Referer": SALON_BOARD_BLOG_CONFIRM_URL,
             "Content-Type": "application/x-www-form-urlencoded",
