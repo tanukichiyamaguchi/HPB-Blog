@@ -28,23 +28,35 @@ class ImageResult:
     prompt: str
 
 
+# Universal beauty defaults — applied to every image regardless of menu_focus.
+# These represent the salon's standard finishing quality.
+_BASE_LASH_STYLE = (
+    "まつげは長めで密度があり、毛先がランダムに集まって自然な束感（クラスター感・たばかん）"
+    "を作る立体的なカール。隙間が美しく、毛束が自然にまとまった仕上がり"
+)
+_BASE_BROW_STYLE = (
+    "眉は毛流れがきれいに整い、1本1本が同じ方向に揃ったナチュラルブロウ。"
+    "眉周りは剃った跡やワックス跡、肌の赤みや凹凸が一切見えない自然な肌質。"
+    "産毛は丁寧に処理されつつ、剃毛感のないなめらかで自然な肌の表情"
+)
+
+
 _MENU_VISUAL_HINTS: dict[str, str] = {
     "眉毛WAX": (
-        "産毛まで丁寧に整えられたナチュラルな眉、自然なアーチ、"
-        "毛流れが整い濃すぎない上品な仕上がり"
+        "今回のメニューは眉毛WAX。眉のラインと毛流れの美しさが特に際立つ仕上がり、"
+        "骨格に合った上品なアーチ"
     ),
     "眉毛スタイリング": (
-        "毛流れが整えられた上品なナチュラルブロウ、骨格に沿った自然なライン、"
-        "アイブロウメイクを引き立てるベース"
+        "今回のメニューは眉毛スタイリング。骨格に沿ったライン取りと毛流れの整いが"
+        "特に映える仕上がり"
     ),
     "まつげパーマ": (
-        "上向きに美しくカールしたまつげ、毛先がランダムに集まって"
-        "束感（クラスター感・たばかん）が出たナチュラルで立体的な仕上がり、"
-        "目元がぱっちりと際立つ自然な印象"
+        "今回のメニューはまつげパーマ。基本の束感をさらに強調し、上向きに大きく"
+        "カールしたまつげで目元がぱっちりと際立つ立体的な仕上がり"
     ),
     "ラッシュリフト": (
-        "根元から自然に立ち上がったまつげ、リフトアップ効果で目元が明るく開いた印象、"
-        "束感は控えめで毛が均一に上向きの自然なリフト"
+        "今回のメニューはラッシュリフト。根元から自然に立ち上がった上向きの"
+        "リフトアップ効果で、目元が明るく開いた印象（束感は基本通り維持）"
     ),
 }
 
@@ -61,6 +73,10 @@ def build_image_prompt(theme: str, menu_focus: str) -> str:
       - Tight crop on EYES + EYEBROWS only — no nose, mouth, hair, forehead, ears
       - White / off-white solid background
       - Photorealistic style
+
+    Universal beauty defaults (every image, regardless of menu_focus):
+      - Lashes: long, dense, with natural bunched/clustered curl
+      - Brows: clean flow, no shaved/waxed look, smooth natural skin
     """
     menu_hint = _MENU_VISUAL_HINTS.get(menu_focus, "ナチュラルで美しい目元のサロンスタイル")
     prompt = (
@@ -69,7 +85,10 @@ def build_image_prompt(theme: str, menu_focus: str) -> str:
         "厳格なトリミング指示：眉の少し上から目の下のごく一部までだけを写す。"
         "鼻・口・頬・顎・耳・髪・額・首・肩は一切フレーム内に入れないこと。"
         "横顔・斜めアングル・俯瞰・あおりは禁止、視線はカメラ正面。\n"
-        f"施術スタイルの仕上がり：{menu_hint}。\n"
+        "【基本の仕上がり（全画像共通・厳守）】\n"
+        f"- まつげ：{_BASE_LASH_STYLE}。\n"
+        f"- 眉：{_BASE_BROW_STYLE}。\n"
+        f"【今回のメニュー強調】{menu_hint}。\n"
         f"テーマ：{theme}。\n"
         "ライティング：柔らかな自然光、明るく清潔感のあるサロン撮影。\n"
         "背景：白〜オフホワイトの単色無地、シンプルでミニマル。\n"

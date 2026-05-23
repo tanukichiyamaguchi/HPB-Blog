@@ -48,19 +48,40 @@ def test_build_image_prompt_excludes_nose_hair_etc():
     assert "フレーム内に入れない" in prompt
 
 
-def test_build_image_prompt_lash_perm_emphasizes_cluster():
-    """User requirement: まつげパーマは束感を意識。"""
+def test_build_image_prompt_universal_lash_style():
+    """User requirement: 全画像で長め＋束感のまつげ。"""
+    # Even for brow-focused menus, the universal lash style applies
+    for menu in ("眉毛WAX", "眉毛スタイリング", "まつげパーマ", "ラッシュリフト"):
+        prompt = build_image_prompt("テーマ", menu)
+        assert "長め" in prompt, f"missing 長め for menu={menu}"
+        assert "束感" in prompt, f"missing 束感 for menu={menu}"
+        assert "クラスター" in prompt, f"missing クラスター for menu={menu}"
+
+
+def test_build_image_prompt_universal_brow_style():
+    """User requirement: 全画像で毛流れ整い・剃り跡なしの眉。"""
+    for menu in ("眉毛WAX", "眉毛スタイリング", "まつげパーマ", "ラッシュリフト"):
+        prompt = build_image_prompt("テーマ", menu)
+        assert "毛流れ" in prompt, f"missing 毛流れ for menu={menu}"
+        assert "剃" in prompt, f"missing 剃 (must mention no-razor-look) for menu={menu}"
+        assert "自然な肌" in prompt, f"missing 自然な肌 for menu={menu}"
+
+
+def test_build_image_prompt_lash_perm_extra_emphasis():
+    """まつげパーマ の場合は基本に加えてさらに強調される。"""
     prompt = build_image_prompt("初夏のまつげケア", "まつげパーマ")
+    # Has the universal base AND extra emphasis for lash perm
     assert "束感" in prompt
-    assert "クラスター" in prompt
+    assert "さらに強調" in prompt
 
 
-def test_build_image_prompt_lash_lift_avoids_cluster_emphasis():
-    """Lash lift differs from perm: natural lift, no cluster emphasis."""
+def test_build_image_prompt_lash_lift_maintains_base_cluster():
+    """Lash lift now keeps base cluster (no longer reduces it)."""
     prompt = build_image_prompt("ラッシュリフト紹介", "ラッシュリフト")
     assert "リフト" in prompt
-    # Lash-lift hint should not promote 束感 (only lash-perm does)
-    assert "束感は控えめ" in prompt
+    # Should NOT downgrade the cluster — universal style still applies
+    assert "束感は控えめ" not in prompt
+    assert "基本通り維持" in prompt
 
 
 def test_build_image_prompt_rejects_forbidden_words():
