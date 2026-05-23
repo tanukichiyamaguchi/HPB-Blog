@@ -981,32 +981,67 @@ class SalonBoardPoster:
         self._screenshot(page, "03_after_login")
 
     def _login_via_curl_cffi(self, page: Page) -> bool:
-        """Hybrid login: extract Playwright cookies, POST via curl_cffi, re-inject.
+        """Try multiple POST strategies for login (each ~15s timeout for fast fail).
 
-        Why hybrid: Playwright Firefox's POST to /CNC/login/doLogin/ is silently
-        dropped by Akamai (verified empirically — Firefox neterror after 30s).
-        But curl_cffi with firefox133 impersonation passes Akamai for GET (Job A
-        diagnostic). Combining these gives us:
-          - Playwright loads the page → Akamai sets _abck, ak_bmsc, bm_sz cookies
-          - curl_cffi POSTs with those cookies → Akamai sees a recognised session
-          - Response cookies (JSESSIONID etc.) are injected back into Playwright
-          - Playwright then navigates to the post-login page for the rest of the flow
+        Background: Playwright form-submit POST is silently dropped by Akamai
+        on our US IP. curl_cffi POST also times out. This method tries every
+        remaining angle in priority order so we get conclusive evidence in one
+        run rather than across several iterations.
         """
-        try:
-            from curl_cffi import requests as cffi_requests  # type: ignore[import-untyped]
-        except ImportError:
-            log.error("curl_cffi not installed; cannot do hybrid login")
-            return False
-
         pw_cookies = page.context.cookies()
         cookie_dict = {c["name"]: c["value"] for c in pw_cookies}
         log.info(
-            "curl_cffi login: %d cookies from Playwright (akamai: _abck=%s ak_bmsc=%s bm_sz=%s)",
+            "login attempt: %d cookies from Playwright (akamai: _abck=%s ak_bmsc=%s bm_sz=%s)",
             len(cookie_dict),
             "yes" if "_abck" in cookie_dict else "no",
             "yes" if "ak_bmsc" in cookie_dict else "no",
             "yes" if "bm_sz" in cookie_dict else "no",
         )
+
+        # ─── Strategy 1: Playwright APIRequestContext.post ───────────────
+        # Uses the BROWSER's network stack (Firefox TLS, session cookies)
+        # but issues the POST directly (no UI navigation). Closest to "what
+        # the browser would do" without triggering page navigation.
+        log.info("Strategy 1: Playwright context.request.post")
+        try:
+            resp = page.context.request.post(
+                SALON_BOARD_LOGIN_POST_URL,
+                form={"userId": self.user_id, "password": self.password},
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+                    "Origin": "https://salonboard.com",
+                    "Referer": SALON_BOARD_LOGIN_URL,
+                    "Upgrade-Insecure-Requests": "1",
+                },
+                max_redirects=0,
+                timeout=20000,
+            )
+            log.info(
+                "Strategy 1 result: HTTP %d, headers=%s",
+                resp.status, {k: v for k, v in resp.headers.items()
+                              if k.lower() in ("location", "content-type", "set-cookie")},
+            )
+            if 300 <= resp.status < 400:
+                loc = resp.headers.get("location", "") or resp.headers.get("Location", "")
+                if loc and "login" not in loc.lower():
+                    target = loc if loc.startswith("http") else f"https://salonboard.com{loc}"
+                    log.info("Strategy 1 succeeded! Navigating Playwright to %s", target)
+                    page.goto(target, timeout=30000, wait_until="domcontentloaded")
+                    return True
+                log.warning("Strategy 1 redirected to login URL: %s (creds may be wrong)", loc)
+            elif resp.status == 200:
+                body_preview = (resp.text() or "")[:500].replace("\n", " ")
+                log.warning("Strategy 1 returned 200 (no redirect): %s", body_preview)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Strategy 1 raised: %s: %s", type(e).__name__, e)
+
+        # ─── Strategy 2: curl_cffi POST to /CNC/login/doLogin/ ───────────
+        try:
+            from curl_cffi import requests as cffi_requests  # type: ignore[import-untyped]
+        except ImportError:
+            log.error("curl_cffi not installed; skipping strategies 2-3")
+            return False
 
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -1020,6 +1055,7 @@ class SalonBoardPoster:
             "userId": self.user_id,
             "password": self.password,
         }
+        log.info("Strategy 2: curl_cffi POST /CNC/login/doLogin/ (firefox133)")
         try:
             resp = cffi_requests.post(
                 SALON_BOARD_LOGIN_POST_URL,
@@ -1027,12 +1063,38 @@ class SalonBoardPoster:
                 cookies=cookie_dict,
                 headers=headers,
                 data=data,
-                timeout=30,
+                timeout=15,
                 allow_redirects=False,
             )
         except Exception as e:  # noqa: BLE001
-            log.error("curl_cffi POST raised: %s: %s", type(e).__name__, e)
-            return False
+            log.warning("Strategy 2 raised: %s: %s", type(e).__name__, e)
+            # Try strategy 3: POST to the form's original action URL
+            log.info("Strategy 3: curl_cffi POST /CNC/idPasswordInput/ (form's original action)")
+            try:
+                resp = cffi_requests.post(
+                    "https://salonboard.com/CNC/idPasswordInput/",
+                    impersonate="firefox133",
+                    cookies=cookie_dict,
+                    headers=headers,
+                    data=data,
+                    timeout=15,
+                    allow_redirects=False,
+                )
+                log.info(
+                    "Strategy 3 result: HTTP %s, Location=%r",
+                    resp.status_code,
+                    resp.headers.get("Location") or resp.headers.get("location") or "",
+                )
+            except Exception as e3:  # noqa: BLE001
+                log.error("Strategy 3 also raised: %s: %s", type(e3).__name__, e3)
+                log.error(
+                    "ALL POST strategies failed. Akamai is blocking POST requests "
+                    "from this IP at the network level (GET works, POST is silently "
+                    "dropped regardless of TLS fingerprint / cookies / library used). "
+                    "Resolution requires a Japan-IP source: Oracle Cloud Tokyo Free "
+                    "(永久無料 / browser-only setup) is the recommended path."
+                )
+                return False
 
         loc = resp.headers.get("Location") or resp.headers.get("location") or ""
         log.info(
