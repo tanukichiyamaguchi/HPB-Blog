@@ -62,12 +62,14 @@ NAVIGATION_TIMEOUT_MS = int(os.environ.get("SB_NAV_TIMEOUT_MS", "90000"))
 PER_SELECTOR_TIMEOUT_MS = int(os.environ.get("SB_PER_SELECTOR_TIMEOUT_MS", "2500"))
 SCREENSHOT_TIMEOUT_MS = int(os.environ.get("SB_SCREENSHOT_TIMEOUT_MS", "15000"))
 
-# Modern Chrome on macOS user-agent — Salon Board is browser-only and may
-# refuse the default Playwright UA.
+# Firefox UA. Critical: Akamai on salonboard.com silently drops requests with a
+# Chromium TLS fingerprint (verified Jan 2026: chromium/chrome131 → timeout;
+# firefox133/safari17 → HTTP 200). Pairing a Firefox UA with the Firefox engine
+# keeps the UA / fingerprint consistent — overriding to a Chrome UA on a Firefox
+# engine would create an inconsistency that some WAFs flag.
 DEFAULT_USER_AGENT = os.environ.get(
     "SB_USER_AGENT",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
 )
 
 
@@ -240,18 +242,24 @@ def _safe_filename(label: str) -> str:
 
 
 def http_preflight(url: str = SALON_BOARD_LOGIN_URL, timeout_s: int = 15) -> dict[str, Any]:
-    """Best-effort raw HTTP probe.
+    """Best-effort raw HTTP probe with a Firefox TLS fingerprint.
 
-    Useful to differentiate geographic / network blocks (request never returns or
-    returns non-200) from browser-only bot detection (request returns 200 but
-    Playwright can't load page).
+    Uses curl_cffi (libcurl-impersonate) because Akamai on salonboard.com
+    silently drops requests with Python's default ``requests`` TLS fingerprint.
+    Firefox impersonation matches what our Playwright Firefox session uses.
+
+    Failure here is non-fatal — Playwright is the source of truth for the
+    actual run. The preflight is purely diagnostic.
     """
     summary: dict[str, Any] = {"url": url}
     try:
-        resp = requests.get(
+        # Lazy import so unit tests don't require curl_cffi at module load.
+        from curl_cffi import requests as cffi_requests  # type: ignore[import-untyped]
+        resp = cffi_requests.get(
             url,
+            impersonate="firefox133",
             timeout=timeout_s,
-            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "ja-JP,ja;q=0.9"},
+            headers={"Accept-Language": "ja-JP,ja;q=0.9"},
             allow_redirects=True,
         )
         summary.update(
@@ -262,32 +270,35 @@ def http_preflight(url: str = SALON_BOARD_LOGIN_URL, timeout_s: int = 15) -> dic
             server=resp.headers.get("server", ""),
         )
         log.info(
-            "HTTP preflight: status=%s len=%d final=%s server=%s",
+            "HTTP preflight (curl_cffi firefox133): status=%s len=%d final=%s server=%s",
             resp.status_code, len(resp.content), resp.url, resp.headers.get("server", ""),
         )
     except Exception as e:  # noqa: BLE001
         summary.update(ok=False, error=f"{type(e).__name__}: {e}")
-        log.warning("HTTP preflight failed: %s", e)
+        log.warning("HTTP preflight failed (non-fatal): %s", e)
     return summary
 
 
-# Init script to soften the most obvious headless/Playwright fingerprints.
+# Init script to hide navigator.webdriver. We deliberately keep this minimal
+# now that we're on Firefox: Chromium-specific shims (window.chrome, plugins
+# named "Chrome PDF Plugin") would themselves be suspicious on a Firefox UA.
 _STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en'] });
-Object.defineProperty(navigator, 'plugins', {
-  get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }],
-});
-window.chrome = window.chrome || { runtime: {} };
-const originalQuery = navigator.permissions && navigator.permissions.query;
-if (originalQuery) {
-  navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications'
-      ? Promise.resolve({ state: Notification.permission })
-      : originalQuery(parameters)
-  );
-}
 """
+
+
+# Firefox-specific launch preferences (Playwright Firefox accepts these via
+# firefox_user_prefs rather than --args).
+_FIREFOX_USER_PREFS = {
+    "intl.accept_languages": "ja-JP,ja",
+    "general.useragent.locale": "ja-JP",
+    # Disable webdriver flag at the engine level
+    "dom.webdriver.enabled": False,
+    # Skip safebrowsing lookups to speed up cold starts in CI
+    "browser.safebrowsing.malware.enabled": False,
+    "browser.safebrowsing.phishing.enabled": False,
+}
 
 
 # --- Poster ---------------------------------------------------------------- #
@@ -529,15 +540,11 @@ class SalonBoardPoster:
 
         results: list[PostResult] = []
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            # Firefox (NOT Chromium): Akamai on salonboard.com silently drops
+            # HTTP responses with a Chromium TLS fingerprint. Firefox passes.
+            browser = p.firefox.launch(
                 headless=self.headless,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--lang=ja-JP",
-                ],
+                firefox_user_prefs=_FIREFOX_USER_PREFS,
             )
             try:
                 context = browser.new_context(
@@ -648,16 +655,10 @@ class SalonBoardPoster:
         http_preflight()
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            # Firefox (NOT Chromium): see note at the post_batch_scheduled launch.
+            browser = p.firefox.launch(
                 headless=self.headless,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    # Reduce headless/automation detection
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--lang=ja-JP",
-                ],
+                firefox_user_prefs=_FIREFOX_USER_PREFS,
             )
             page: Page | None = None
             try:

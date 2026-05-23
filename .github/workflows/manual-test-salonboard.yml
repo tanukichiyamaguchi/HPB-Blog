@@ -45,8 +45,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Install Playwright browser
+        # Firefox (NOT Chromium) — see daily-blog.yml for rationale.
         run: |
-          python -m playwright install --with-deps chromium
+          python -m playwright install --with-deps firefox
 
       - name: Run unit tests (no API needed)
         run: pytest -q

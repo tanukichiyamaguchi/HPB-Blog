@@ -125,7 +125,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requir
 
 # ---- 4. Playwright Chromium ----
 echo "[4/6] Installing Playwright Chromium (this can take a few minutes)..."
-sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/python" -m playwright install chromium
+sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/python" -m playwright install firefox
 
 # ---- 5. .env template ----
 echo "[5/6] Preparing .env..."

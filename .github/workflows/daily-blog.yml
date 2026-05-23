@@ -44,7 +44,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Install Playwright browser
-        run: python -m playwright install --with-deps chromium
+        # Firefox (NOT Chromium): Akamai on salonboard.com silently drops
+        # Chromium TLS fingerprints. Firefox passes — verified Jan 2026.
+        run: python -m playwright install --with-deps firefox
 
       - name: Run unit tests
         run: pytest -q

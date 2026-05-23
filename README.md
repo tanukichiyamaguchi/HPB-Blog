@@ -8,33 +8,32 @@
 
 ## 運用モード
 
-GitHub Actions ランナーは米国IPで salonboard.com への接続が遮断されるため、
-サロンボードへの自動投稿は **日本IPから実行する必要** があります。
+### 🔵 推奨: GitHub Actions で完全クラウド運用（**永久無料・追加環境不要**）
 
-### 🔵 推奨: Oracle Cloud Tokyo Always Free（**永久無料・ブラウザのみ**）
+salonboard.com の Akamai Bot Manager は **Chromium 系の TLS フィンガープリント
+のみ** を選択的に遮断していることが診断で判明（Firefox/WebKit は通過）。
+Playwright を **Firefox エンジン** で動かすことで、米国 GitHub Actions ランナー
+（US Azure IP）からそのままアクセス可能。
 
-完全無料の Oracle Cloud Tokyo Always Free Tier 上に Ubuntu VM を立て、
-**Linux cron が JST 22:15 に毎日自動実行** → 翌朝8:15 公開予約。
-セットアップから運用まで **ブラウザのみ**（PCへのインストール一切不要）。
+| 項目 | 状況 |
+|------|------|
+| 月額費用 | **¥0**（GitHub Actions 無料枠内）|
+| VPS / PC 設定 | **不要** |
+| 設定変更 | Repo Variables `ENABLE_DAILY_CRON=true` をセットするだけ |
 
-セットアップは **[docs/ORACLE_CLOUD_SETUP.md](docs/ORACLE_CLOUD_SETUP.md)** を参照（所要1.5〜2時間）。
+cron は `.github/workflows/daily-blog.yml` が **JST 22:15** に自動起動 →
+翌朝 8:15 公開予約として 1 日 1 件を Salon Board に登録。
 
-VM 内ブラウザ Cloud Shell で以下を貼るだけで自動セットアップ:
-```bash
-curl -fsSL https://raw.githubusercontent.com/tanukichiyamaguchi/HPB-Blog/main/scripts/install_on_vps.sh | bash
-```
-
-### 🟡 代替: 有料VPS（日本リージョン）
-
-お名前.com VPS（¥520〜）/ さくらのVPS（¥683〜）/ Conoha VPS（¥483〜）。
-セットアップ手順は **[docs/VPS_SETUP.md](docs/VPS_SETUP.md)**。
-Oracle Cloud で Out of Capacity が続く場合や安定運用を求める場合の選択肢。
-
-### 🟢 代替: Windows PC で週次バッチ
+### 🟡 代替: Windows PC で週次バッチ
 
 サロン PC で **週1回 `run_weekly.bat` をダブルクリック**、**7日分の予約投稿**
-を一括で登録する方式。コスト無料だが PC への Python 環境構築が必要。
-セットアップは **[docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)**。
+を一括で登録する方式。セットアップ手順は **[docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)**。
+
+### 🟡 代替: 日本VPS / Oracle Cloud Tokyo Free（GitHub Actions が将来塞がれた場合）
+
+将来 Akamai が Firefox TLS も遮断したり、運用上の理由で日本IP出口が必要に
+なった場合のバックアップ。詳細は **[docs/VPS_SETUP.md](docs/VPS_SETUP.md)** /
+**[docs/ORACLE_CLOUD_SETUP.md](docs/ORACLE_CLOUD_SETUP.md)**。
 
 ---
 
@@ -157,24 +156,25 @@ GitHub Actions IPからサロンボードへの到達性を確認するための
 
 ## トラブルシューティング
 
-### Salon Board に接続できない（GitHub Actions ランナーから）
+### Salon Board に接続できない（タイムアウトする）
 
-GitHub Actions の公式ホストランナー（Microsoft Azure 米国 IP）からは
-`salonboard.com` への TCP 接続が遮断されます（リクルート社側の WAF 等
-による地理的ブロックと推定）。HTTP プリフライトログに
-`Read timed out` が出る場合がこれです。
+**原因**: salonboard.com の Akamai Bot Manager は **Chromium 系の TLS
+フィンガープリント** を選択的に遮断します。Playwright の `chromium.launch()`
+や Python の `requests` / `curl` はこれに該当し、TLS ハンドシェイクは通るが
+HTTP レスポンスが返らず 30 秒で timeout します。
 
-回避策（いずれも **日本IPからの実行** が必要）:
+**対応**: 本リポジトリでは `firefox.launch()` を使用しており、診断で
+Firefox / WebKit / curl_cffi の Safari17・Firefox133 フィンガープリントが
+HTTP 200 で通ることを確認済（2026年1月時点）。コードを Chromium ベースに
+書き戻すと再発します。
 
-1. **GitHub Actions self-hosted runner（推奨）**
-   日本国内の PC / VPS / クラウド VM 上に
-   [GitHub Actions runner](https://docs.github.com/actions/hosting-your-own-runners)
-   をインストールし、`daily-blog.yml` の `runs-on:` を
-   `self-hosted` または専用ラベルに変更。
-2. **日本リージョンの常時稼働 VM**（Oracle Cloud Tokyo Free Tier、
-   さくらのVPS、Conoha、AWS Lightsail Tokyo 等）に runner を配置。
-3. **日本IP出口プロキシ**（Bright Data の Japan residential 等、有料）を
-   `SALON_BOARD_PROXY` env で指定（コード側で受け取り口は実装済み）。
+将来 Firefox も遮断された場合のバックアップ:
+- 日本 IP の VPS / Oracle Cloud → **[docs/VPS_SETUP.md](docs/VPS_SETUP.md)**
+- 日本 IP の self-hosted runner → `daily-blog.yml` の `runs-on:` を
+  `self-hosted` に変更
+
+診断ワークフロー：`.github/workflows/network-diagnostic.yml` /
+`extra-diagnostics.yml` で `salonboard.com` への到達性を任意に検証可能。
 
 ### モデルが見つからない（404 / model_not_found）
 

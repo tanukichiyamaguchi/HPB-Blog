@@ -44,7 +44,7 @@ if errorlevel 1 (
 
 REM 4. Install Playwright browser
 echo [INFO] Playwright Chromium をインストール中（初回は数分かかります）...
-python -m playwright install chromium
+python -m playwright install firefox
 if errorlevel 1 (
     echo [ERROR] Playwright ブラウザのインストールに失敗しました。
     pause
