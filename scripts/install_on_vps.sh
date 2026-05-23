@@ -32,6 +32,47 @@ echo "  REPO_BRANCH = $REPO_BRANCH"
 echo "  RUN_USER    = $RUN_USER"
 echo ""
 
+# ---- 0. Pre-flight salonboard.com reachability check ----
+echo "[0/6] Pre-flight: verifying this VPS can reach salonboard.com ..."
+PUBLIC_IP="$(curl -fsS --max-time 10 https://api.ipify.org || echo unknown)"
+echo "  This VPS's public IP: $PUBLIC_IP"
+
+# Quick geo info (informational)
+curl -fsS --max-time 10 "https://ipinfo.io/${PUBLIC_IP}" 2>/dev/null \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);print(f'  Geo: {d.get(\"city\")}, {d.get(\"region\")}, {d.get(\"country\")} ({d.get(\"org\")})')" \
+    2>/dev/null || true
+
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+SB_STATUS="$(curl -I -s -o /dev/null -w '%{http_code}' --max-time 20 -A "$UA" https://salonboard.com/login/ || echo "000")"
+echo "  HTTP status from this VPS to https://salonboard.com/login/ : $SB_STATUS"
+
+if [ "$SB_STATUS" = "000" ]; then
+    echo ""
+    echo "  ❌ STOP: This VPS cannot reach salonboard.com (timeout / no response)."
+    echo "     Akamai's bot manager is likely blocking this IP range."
+    echo "     Options:"
+    echo "       1) Try a different VPS provider / region (Japan residential-style IP)"
+    echo "       2) If on Oracle Cloud, terminate this instance and retry in a"
+    echo "          different Availability Domain"
+    echo "       3) Use a paid Japan VPS (Sakura, Conoha, Onamae VPS — typically"
+    echo "          have cleaner IP reputation)"
+    echo ""
+    echo "     This VPS is NOT viable for the salon-board automation. Aborting setup."
+    exit 2
+fi
+
+if [ "$SB_STATUS" = "403" ] || [ "$SB_STATUS" = "429" ]; then
+    echo ""
+    echo "  ⚠️  WARNING: salonboard.com returned HTTP $SB_STATUS — application-layer"
+    echo "     block. The site responded but rejected the request. Real-browser"
+    echo "     (Playwright) MAY still work since it has correct TLS fingerprint."
+    echo "     Continuing setup, but be prepared for login failures."
+    sleep 3
+fi
+
+echo "  ✅ salonboard.com is reachable from this VPS. Proceeding."
+echo ""
+
 # ---- 1. OS deps ----
 echo "[1/6] Installing OS dependencies..."
 if command -v apt-get >/dev/null 2>&1; then
