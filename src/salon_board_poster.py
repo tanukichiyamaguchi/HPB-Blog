@@ -1055,10 +1055,16 @@ class SalonBoardPoster:
             "userId": self.user_id,
             "password": self.password,
         }
-        log.info("Strategy 2: curl_cffi POST /CNC/login/doLogin/ (firefox133)")
+        # ─── Strategy 3: curl_cffi POST /CNC/idPasswordInput/ ────────────
+        # Previous run proved this endpoint accepts POST while /CNC/login/doLogin/
+        # is silently dropped by Akamai. We jump straight here and skip the doLogin
+        # endpoint to save ~30s of inevitable timeout. /CNC/idPasswordInput/ is the
+        # form's *original* `action` attribute — likely the legacy / less-protected
+        # endpoint.
+        log.info("Strategy 3: curl_cffi POST /CNC/idPasswordInput/ (form's original action)")
         try:
             resp = cffi_requests.post(
-                SALON_BOARD_LOGIN_POST_URL,
+                "https://salonboard.com/CNC/idPasswordInput/",
                 impersonate="firefox133",
                 cookies=cookie_dict,
                 headers=headers,
@@ -1066,41 +1072,31 @@ class SalonBoardPoster:
                 timeout=15,
                 allow_redirects=False,
             )
-        except Exception as e:  # noqa: BLE001
-            log.warning("Strategy 2 raised: %s: %s", type(e).__name__, e)
-            # Try strategy 3: POST to the form's original action URL
-            log.info("Strategy 3: curl_cffi POST /CNC/idPasswordInput/ (form's original action)")
-            try:
-                resp = cffi_requests.post(
-                    "https://salonboard.com/CNC/idPasswordInput/",
-                    impersonate="firefox133",
-                    cookies=cookie_dict,
-                    headers=headers,
-                    data=data,
-                    timeout=15,
-                    allow_redirects=False,
-                )
-                log.info(
-                    "Strategy 3 result: HTTP %s, Location=%r",
-                    resp.status_code,
-                    resp.headers.get("Location") or resp.headers.get("location") or "",
-                )
-            except Exception as e3:  # noqa: BLE001
-                log.error("Strategy 3 also raised: %s: %s", type(e3).__name__, e3)
-                log.error(
-                    "ALL POST strategies failed. Akamai is blocking POST requests "
-                    "from this IP at the network level (GET works, POST is silently "
-                    "dropped regardless of TLS fingerprint / cookies / library used). "
-                    "Resolution requires a Japan-IP source: Oracle Cloud Tokyo Free "
-                    "(永久無料 / browser-only setup) is the recommended path."
-                )
-                return False
+        except Exception as e3:  # noqa: BLE001
+            log.error("Strategy 3 raised: %s: %s", type(e3).__name__, e3)
+            log.error(
+                "ALL POST strategies failed. Akamai is blocking POST requests "
+                "from this IP at the network level. Resolution requires a "
+                "Japan-IP source: Oracle Cloud Tokyo Free (永久無料)."
+            )
+            return False
 
         loc = resp.headers.get("Location") or resp.headers.get("location") or ""
         log.info(
             "curl_cffi POST: HTTP %s, Location=%r, body_len=%d",
             resp.status_code, loc, len(resp.text or ""),
         )
+
+        # Persist the full response body to artifacts so we can inspect any
+        # JS auto-submit, meta-refresh, or hidden fields in the post-credentials
+        # response.
+        try:
+            self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+            resp_path = self.screenshots_dir / "login_post_response.html"
+            resp_path.write_text(resp.text or "", encoding="utf-8")
+            log.info("Saved full POST response to %s (%d chars)", resp_path, len(resp.text or ""))
+        except Exception as e:  # noqa: BLE001
+            log.debug("Failed to save response body: %s", e)
 
         # Capture any new cookies (JSESSIONID, refreshed _abck, etc.).
         new_cookies: list[dict[str, Any]] = []
@@ -1122,38 +1118,52 @@ class SalonBoardPoster:
         if new_cookies:
             try:
                 page.context.add_cookies(new_cookies)
-                log.info("Injected %d response cookies into Playwright", len(new_cookies))
+                log.info(
+                    "Injected %d response cookies into Playwright (names: %s)",
+                    len(new_cookies), [c["name"] for c in new_cookies],
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning("Cookie injection failed: %s", e)
 
-        # Login success heuristic: HTTP redirect (302/303) to a non-login URL.
-        if resp.status_code in (301, 302, 303) and loc:
-            target = loc if loc.startswith("http") else f"https://salonboard.com{loc}"
-            if "/login" in target.lower():
-                log.warning(
-                    "Login redirected back to a login-related URL (%s); credentials may be wrong",
-                    target,
-                )
-                # Dump first chunk of redirect target for diagnostics
-                body_preview = (resp.text or "")[:500].replace("\n", " ")
-                if body_preview:
-                    log.warning("POST response body preview: %s", body_preview)
-                return False
-            log.info("Login success; navigating Playwright to %s", target)
+        # ─── Probe authentication by navigating to an authed area. ──────
+        # Many Salon Board flows return HTTP 200 + login-shaped HTML even after
+        # successful credentials acceptance (multi-step login, JS auto-submit,
+        # or rendering the next step inline). The only reliable check is to
+        # navigate to a known-protected URL with the session cookies and see
+        # if we land there or get bounced back to /login/.
+        if resp.status_code in (200, 301, 302, 303):
+            if resp.status_code in (301, 302, 303) and loc:
+                probe_target = loc if loc.startswith("http") else f"https://salonboard.com{loc}"
+            else:
+                # No explicit redirect; navigate to the salon board top URL.
+                probe_target = "https://salonboard.com/KLP/"
+            log.info("Probing authentication state by navigating to %s", probe_target)
             try:
-                page.goto(target, timeout=30000, wait_until="domcontentloaded")
+                nav_resp = page.goto(probe_target, timeout=30000, wait_until="domcontentloaded")
+                final_url = page.url
+                final_status = nav_resp.status if nav_resp else None
+                log.info(
+                    "Auth probe: navigated to %s (HTTP %s)", final_url, final_status,
+                )
+                # Logged in if URL no longer contains "/login/" or "/CNC/"
+                if "/login" in final_url.lower():
+                    log.warning(
+                        "Auth probe landed on a login page (%s); credentials likely rejected "
+                        "OR Salon Board requires multi-step flow we haven't implemented.",
+                        final_url,
+                    )
+                    self._screenshot(page, "02b_auth_probe_failed")
+                    self._dump_form_html(page, "02c_auth_probe_failed")
+                    return False
+                # Looks logged in
+                log.info("🎉 Authenticated; final URL=%s", final_url)
+                self._screenshot(page, "02_after_login")
+                return True
             except Exception as e:  # noqa: BLE001
-                log.error("Post-login navigation to %s failed: %s", target, e)
+                log.error("Auth probe navigation failed: %s: %s", type(e).__name__, e)
                 return False
-            return True
 
-        # HTTP 200 with no redirect = the login page re-rendered with an error.
-        if resp.status_code == 200:
-            body_preview = (resp.text or "")[:800].replace("\n", " ")
-            log.warning("Login POST returned 200 (no redirect). Body preview: %s", body_preview)
-            return False
-
-        # Anything else (e.g. 403, 503, timeout-as-error) → fail with full info.
+        # Anything else (e.g. 403, 503) → fail with full info.
         log.warning(
             "Unexpected POST status %s. Headers: %s",
             resp.status_code, dict(resp.headers),
