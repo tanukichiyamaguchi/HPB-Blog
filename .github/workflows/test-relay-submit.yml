@@ -19,13 +19,13 @@ on:
         options: ['no', 'yes']
         default: 'no'
       reserve_date:
-        description: 'Reservation date YYYYMMDD (default = 1 year from today)'
+        description: 'Reservation date YYYYMMDD (default = 7 days ahead; SB window: ~14 days max)'
         required: false
         default: ''
       reserve_time:
-        description: 'Reservation time HHMM (default = 0000)'
+        description: 'Reservation time HHMM (default = 0815; SB blocks 03:15–08:00)'
         required: false
-        default: '0000'
+        default: '0815'
       title:
         description: 'Blog title (test marker推奨)'
         required: false
@@ -122,7 +122,10 @@ jobs:
           if rsv_date_str:
               reserve_dt = datetime.strptime(rsv_date_str + rsv_time_str, "%Y%m%d%H%M")
           else:
-              base = datetime.now() + timedelta(days=365)
+              # Salon Board は今日から約14日先までしか予約を受け付けないので
+              # デフォルトは 7 日後（充分な safety margin）。
+              # 時刻はデフォルト 08:15（本番運用の翌朝投稿パターンと一致）。
+              base = datetime.now() + timedelta(days=7)
               reserve_dt = base.replace(
                   hour=int(rsv_time_str[:2]), minute=int(rsv_time_str[2:]),
                   second=0, microsecond=0,

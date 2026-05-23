@@ -552,6 +552,27 @@ def _parse_form_tokens(body: str) -> tuple[str, str]:
     return csrf, tab
 
 
+# Extract <option value="..."> values from a named <select> in the form HTML.
+# Used to validate rsvTokoDate / rsvTokoTime against Salon Board's allowed window
+# *before* POSTing — otherwise the server returns a generic KPCL030V02 error
+# page that doesn't tell us which field was wrong.
+_OPTION_VALUE_RE = re.compile(r'<option\s+value="([^"]*)"', re.IGNORECASE)
+
+
+def _select_options(body: str, select_name: str) -> list[str]:
+    """Return the option values inside <select name="select_name">...</select>.
+
+    Empty string options are filtered out (they're placeholder "" entries).
+    """
+    sel = re.search(
+        rf'<select[^>]*name="{re.escape(select_name)}"[^>]*>(.+?)</select>',
+        body, re.IGNORECASE | re.DOTALL,
+    )
+    if not sel:
+        return []
+    return [v for v in _OPTION_VALUE_RE.findall(sel.group(1)) if v]
+
+
 def _dump_debug_body(label: str, body: str) -> str | None:
     """If SALON_BOARD_DEBUG_DUMP_DIR is set, write body to <dir>/<label>.html.
 
@@ -597,8 +618,10 @@ def submit_blog(
         staff_id: 投稿スタッフ ID。``STAFF_IDS`` の値から1つを渡す。
         reserve_dt: 予約投稿日時。tz-naive でも tz-aware でも構わないが、
             Salon Board は JST で扱うので JST のローカル時刻として送信する。
-            分以上の精度は送信されず分単位で 00 にされるわけではなく、
-            HHMM そのまま送る（実際の予約スロットは 00分/15分/30分/45分のみ）。
+            ※ Salon Board の予約 window 制約:
+              - 日付: 今日から約14日先まで
+              - 時刻: 00:00–03:00 と 08:15–23:45 の 15分刻みのみ（03:15–08:00 不可）
+            window 外の値を渡すと事前 validation で RuntimeError を投げる。
         category_code: ``BLOG_CATEGORY_CODES`` の値。デフォルトは "おすすめメニュー" (KL03)。
         image_paths: 最大4枚までの画像ファイルパス。None / 空なら画像なし投稿。
         unpublish_staff_ids: 非掲載スタッフ ID リスト。None なら
@@ -653,6 +676,29 @@ def submit_blog(
         "  Initial form tokens: csrf=%s..., tab=%s...; cookies: %s",
         csrf_in[:8], tab_in[:8], sorted(relay.cookies.keys()),
     )
+
+    # Validate reserve_dt against Salon Board's actual allowed values.
+    # The reservation window is roughly today + 13 days, and times exclude
+    # the 03:15–08:00 maintenance window. Sending an out-of-range value gets
+    # silently rejected as a generic "KPCL030V02 / 操作しなおしてください" error
+    # with no field-level message, so we validate up front.
+    rsv_date_pre = reserve_dt.strftime("%Y%m%d")
+    rsv_time_pre = reserve_dt.strftime("%H%M")
+    allowed_dates = _select_options(r.body_text, "rsvTokoDate")
+    allowed_times = _select_options(r.body_text, "rsvTokoTime")
+    if allowed_dates and rsv_date_pre not in allowed_dates:
+        raise RuntimeError(
+            f"reserve_dt date {rsv_date_pre} is outside Salon Board's "
+            f"reservation window. Allowed: {allowed_dates[0]}..{allowed_dates[-1]} "
+            f"({len(allowed_dates)} days)."
+        )
+    if allowed_times and rsv_time_pre not in allowed_times:
+        raise RuntimeError(
+            f"reserve_dt time {rsv_time_pre} is not selectable. "
+            f"Salon Board blocks 03:15–08:00 (maintenance window). "
+            f"Allowed times: {len(allowed_times)} slots, "
+            f"e.g. {', '.join(allowed_times[:5])}..."
+        )
 
     # ----- Step 2: Upload images sequentially -----
     image_urls: list[str] = []
