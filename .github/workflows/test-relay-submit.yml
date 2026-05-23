@@ -1,0 +1,166 @@
+name: Test Relay Submit (E2E)
+
+# submit_blog() の動作をリレー経由で実機検証する。
+#
+# 安全策:
+#   confirm_post=yes を明示しない限り、Salon Board への実投稿は行わない。
+#   read-only 検証（login + フォーム GET + CSRF/storeIdForMultipleTabCheck パース）
+#   までで停止する。
+#
+# confirm_post=yes の場合は予約投稿が1件作成されるので、テスト後は
+# Salon Board の「ブログ一覧」から手動で削除すること。
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_post:
+        description: 'Actually create a reserved post? (yes = full E2E, no = read-only)'
+        type: choice
+        options: ['no', 'yes']
+        default: 'no'
+      reserve_date:
+        description: 'Reservation date YYYYMMDD (default = 1 year from today)'
+        required: false
+        default: ''
+      reserve_time:
+        description: 'Reservation time HHMM (default = 0000)'
+        required: false
+        default: '0000'
+      title:
+        description: 'Blog title (test marker推奨)'
+        required: false
+        default: '[TEST-DELETE-ME] relay e2e'
+      staff:
+        description: 'Author staff key'
+        type: choice
+        options: ['momo', 'aoi']
+        default: 'momo'
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install minimal deps
+        run: pip install --quiet 'requests>=2.32.0'
+
+      - name: '[1] Login + form load (always run, read-only)'
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          python3 << 'PYEOF'
+          import logging, os, sys
+          logging.basicConfig(level=logging.INFO,
+                              format="%(asctime)s [%(levelname)s] %(message)s")
+          sys.path.insert(0, "src")
+          from salon_board_relay import (
+              SalonBoardRelay, login,
+              SALON_BOARD_BLOG_NEW_URL, _parse_form_tokens,
+          )
+
+          relay = SalonBoardRelay(os.environ["RELAY_URL"], os.environ["RELAY_SECRET"])
+
+          print("\n=== Login ===")
+          login(relay, os.environ["SALON_BOARD_ID"], os.environ["SALON_BOARD_PASSWORD"])
+          print(f"✅ logged in (session={relay.session_id})")
+
+          print("\n=== Form GET + token parse ===")
+          r = relay.get(SALON_BOARD_BLOG_NEW_URL, headers={
+              "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+          })
+          if r.status != 200:
+              print(f"❌ form GET HTTP {r.status}")
+              sys.exit(1)
+          try:
+              csrf, tab = _parse_form_tokens(r.body_text)
+          except RuntimeError as e:
+              print(f"❌ token parse failed: {e}")
+              sys.exit(2)
+          print(f"✅ form GET ok: csrf={csrf[:12]}..., storeIdForMultipleTabCheck={tab[:12]}...")
+          PYEOF
+
+      - name: '[2] Full submit (only if confirm_post=yes)'
+        if: ${{ inputs.confirm_post == 'yes' }}
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+          INPUT_RESERVE_DATE: ${{ inputs.reserve_date }}
+          INPUT_RESERVE_TIME: ${{ inputs.reserve_time }}
+          INPUT_TITLE: ${{ inputs.title }}
+          INPUT_STAFF: ${{ inputs.staff }}
+        run: |
+          python3 << 'PYEOF'
+          import logging, os, sys
+          from datetime import datetime, timedelta
+
+          logging.basicConfig(level=logging.INFO,
+                              format="%(asctime)s [%(levelname)s] %(message)s")
+          sys.path.insert(0, "src")
+          from salon_board_relay import (
+              SalonBoardRelay, login, submit_blog, STAFF_IDS,
+          )
+
+          rsv_date_str = os.environ.get("INPUT_RESERVE_DATE", "").strip()
+          rsv_time_str = (os.environ.get("INPUT_RESERVE_TIME", "").strip() or "0000")
+          if len(rsv_time_str) != 4 or not rsv_time_str.isdigit():
+              print(f"❌ invalid reserve_time: {rsv_time_str!r} (HHMM expected)")
+              sys.exit(1)
+
+          if rsv_date_str:
+              reserve_dt = datetime.strptime(rsv_date_str + rsv_time_str, "%Y%m%d%H%M")
+          else:
+              base = datetime.now() + timedelta(days=365)
+              reserve_dt = base.replace(
+                  hour=int(rsv_time_str[:2]), minute=int(rsv_time_str[2:]),
+                  second=0, microsecond=0,
+              )
+
+          title = os.environ.get("INPUT_TITLE") or "[TEST-DELETE-ME] relay e2e"
+          staff_key = os.environ.get("INPUT_STAFF", "momo")
+          if staff_key not in STAFF_IDS:
+              print(f"❌ unknown staff: {staff_key} (choose from {sorted(STAFF_IDS)})")
+              sys.exit(1)
+          staff_id = STAFF_IDS[staff_key]
+
+          relay = SalonBoardRelay(os.environ["RELAY_URL"], os.environ["RELAY_SECRET"])
+          login(relay, os.environ["SALON_BOARD_ID"], os.environ["SALON_BOARD_PASSWORD"])
+
+          print("\n=== submit_blog() — FULL E2E (creates real reserved post) ===")
+          complete_url = submit_blog(
+              relay,
+              title=title,
+              body=(
+                  "<p>これは GitHub Actions からの E2E テスト投稿です。"
+                  "手動で削除してください。</p>"
+              ),
+              staff_id=staff_id,
+              reserve_dt=reserve_dt,
+              category_code="KL03",
+              image_paths=None,
+          )
+
+          print("\n🎉 SUCCESS")
+          print(f"   Title:    {title}")
+          print(f"   Staff:    {staff_key} ({staff_id})")
+          print(f"   Reserved: {reserve_dt.strftime('%Y-%m-%d %H:%M')}")
+          print(f"   Redirect: {complete_url}")
+          print("\n⚠️  ACTION REQUIRED: Salon Board のブログ一覧から該当テスト記事を削除してください。")
+          PYEOF
+
+      - name: '[summary]'
+        if: ${{ inputs.confirm_post != 'yes' }}
+        run: |
+          echo ""
+          echo "ℹ️  read-only verification only (confirm_post=${{ inputs.confirm_post }})"
+          echo "    To run the full E2E test, dispatch again with confirm_post=yes."
