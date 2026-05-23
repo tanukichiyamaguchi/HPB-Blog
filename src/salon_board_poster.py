@@ -461,6 +461,102 @@ class SalonBoardPoster:
         log.info("Akamai cookies @ %s: %s",
                  label, ", ".join(summary) if summary else "(none)")
 
+    @staticmethod
+    def _abck_is_validated(cookie_value: str) -> bool:
+        """Heuristic: _abck is considered validated when its last segment != '-1'.
+
+        Akamai's _abck cookie is tilde-delimited; the LAST segment is the
+        bot-score state. '-1' means "challenge pending / not yet validated";
+        anything else (typically '0', a session token, or a count) indicates
+        the sensor JS has accepted the client. POST endpoints are usually
+        rejected until this transitions away from '-1'.
+        """
+        parts = cookie_value.split("~")
+        return len(parts) >= 2 and parts[-1] != "-1"
+
+    def _wait_for_akamai_validation(self, page: Page, max_wait_s: int = 20) -> bool:
+        """Poll until _abck transitions away from '~-1' tail (validated)."""
+        import time as _t
+        deadline = _t.monotonic() + max_wait_s
+        last_tail = ""
+        while _t.monotonic() < deadline:
+            try:
+                cookies = page.context.cookies()
+            except Exception:  # noqa: BLE001
+                cookies = []
+            for c in cookies:
+                if c.get("name") == "_abck":
+                    val = c.get("value", "")
+                    tail = val.split("~")[-1] if val else ""
+                    if tail != last_tail:
+                        log.info("_abck tail update: %r", tail)
+                        last_tail = tail
+                    if self._abck_is_validated(val):
+                        return True
+            try:
+                page.wait_for_timeout(500)
+            except Exception:  # noqa: BLE001
+                break
+        return False
+
+    def _simulate_human_interaction(self, page: Page) -> None:
+        """Generate realistic mouse / scroll / focus events.
+
+        Akamai's bot manager scores the client based on observed behavioural
+        signals (mousemove, scroll, keystroke timing). Headless automation
+        with synthetic events typically scores as bot; without a higher score,
+        the _abck cookie never validates and POST endpoints reject the request.
+        This routine fires a small but realistic burst of events.
+        """
+        try:
+            # Move mouse to several positions, with multi-step interpolation
+            # (Playwright fires multiple mousemove events per step).
+            positions = [(120, 180), (480, 320), (640, 240), (260, 480), (520, 360)]
+            for x, y in positions:
+                page.mouse.move(x, y, steps=15)
+                page.wait_for_timeout(140)
+            # A small scroll down then up
+            page.mouse.wheel(0, 80)
+            page.wait_for_timeout(220)
+            page.mouse.wheel(0, -60)
+            page.wait_for_timeout(220)
+            # Hover the body to trigger more activity
+            try:
+                page.locator("body").first.hover(timeout=1500)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001
+            log.debug("Human-interaction simulation failed: %s", e)
+
+    def _type_into(
+        self, page: Page, selectors: Sequence[str], value: str, label: str,
+        delay_ms: int = 60,
+    ) -> bool:
+        """Click+type into the first matching input, firing real key events.
+
+        Replaces fill() for fields where Akamai-style sensors need to observe
+        keydown/keypress/keyup. .fill() merely sets the DOM value property,
+        which fires only 'input' but NO keyboard events.
+        """
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                # Real mouse click to focus (also fires Akamai-visible events)
+                loc.click(timeout=self.per_selector_timeout_ms)
+                page.wait_for_timeout(80)
+                # Clear any existing value, then type with realistic per-key delay
+                try:
+                    loc.fill("", timeout=1000)
+                except Exception:  # noqa: BLE001
+                    pass
+                loc.type(value, delay=delay_ms)
+                log.info("Typed %s via selector: %s", label, sel)
+                return True
+            except Exception as e:  # noqa: BLE001
+                log.debug("Type %s with %s failed: %s", label, sel, e)
+        log.warning("Could not type %s via any of %d selectors", label, len(selectors))
+        return False
+
     def _wait_for_login_complete(self, page: Page, timeout_s: int = 45) -> bool:
         """Wait until the page navigates away from the login URL.
 
@@ -846,21 +942,39 @@ class SalonBoardPoster:
         # Initial form HTML for diagnosability (no input values in outerHTML).
         self._dump_form_html(page, "01_login_initial")
 
-        # Give Akamai's bot-manager JS a moment to set its _abck / ak_bmsc
-        # cookies. Submitting before these are populated triggers a silent
-        # POST drop. 2 seconds is enough on a 1.5s page load.
+        # Phase 1: let Akamai's sensor JS load and register the page.
         try:
             page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:  # noqa: BLE001
             pass
-        page.wait_for_timeout(1500)
-        self._log_akamai_cookies(page, "before_fill")
+        page.wait_for_timeout(1000)
+        self._log_akamai_cookies(page, "after_load")
 
-        if not self._try_fill(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
-            raise RuntimeError("Could not locate login ID input")
-        if not self._try_fill(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
-            raise RuntimeError("Could not locate password input")
+        # Phase 2: human-like interaction to feed Akamai's behavioural sensor.
+        # Without this, _abck stays at '~-1' (challenge pending) and the POST
+        # endpoint silently drops the request. We then poll _abck until it
+        # transitions away from '-1' — or up to 20s, then proceed regardless.
+        log.info("Simulating human interaction to advance Akamai sensor...")
+        self._simulate_human_interaction(page)
+        if self._wait_for_akamai_validation(page, max_wait_s=20):
+            log.info("_abck validated — Akamai sensor accepted the client")
+        else:
+            log.warning("_abck not validated within 20s — POST may still be dropped")
+        self._log_akamai_cookies(page, "after_human_sim")
+
+        # Phase 3: type credentials with realistic per-key delay so the sensor
+        # observes keydown/keypress/keyup (fill() does NOT fire these).
+        if not self._type_into(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
+            # Fallback to .fill() if .type() couldn't find inputs.
+            if not self._try_fill(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
+                raise RuntimeError("Could not locate login ID input")
+        if not self._type_into(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
+            if not self._try_fill(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
+                raise RuntimeError("Could not locate password input")
         # NOTE: no "02_login_filled" screenshot — would leak loginID in artifacts.
+
+        # Give Akamai 1-2 more seconds to process the keypress burst.
+        page.wait_for_timeout(1500)
 
         # Detect early if a background request put the page in Firefox's neterror.
         body_class = self._safe_eval(page, "document.body && document.body.className || ''")
@@ -869,7 +983,7 @@ class SalonBoardPoster:
                 f"Page became Firefox neterror after fill (body.class={body_class!r}); "
                 "Akamai likely blocked a background request from the login page."
             )
-        self._log_akamai_cookies(page, "after_fill")
+        self._log_akamai_cookies(page, "after_typing")
 
         # ----- Submit (three strategies, each with no_wait_after so we don't
         #       hang waiting for navigation that Akamai might silently drop). -----
