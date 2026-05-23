@@ -69,6 +69,10 @@ jobs:
           UPDATE_THEME_HISTORY: "true"
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PYTHONUNBUFFERED: "1"
+          # On any relay-side failure (login form re-shown, KPCL error, etc.)
+          # the relay client dumps the failing HTML response here so we can
+          # see exactly what Salon Board returned without rerunning.
+          SALON_BOARD_DEBUG_DUMP_DIR: ${{ github.workspace }}/debug-dumps
         run: python -m src.main
 
       - name: Commit theme history
@@ -84,11 +88,33 @@ jobs:
             echo "No changes to theme_history.json"
           fi
 
+      - name: Show debug dumps in log (on failure)
+        if: failure()
+        run: |
+          set +e
+          DIR="${{ github.workspace }}/debug-dumps"
+          if [ ! -d "$DIR" ]; then
+            echo "No debug-dumps directory"
+            exit 0
+          fi
+          for f in "$DIR"/*.html "$DIR"/*.txt; do
+            [ -e "$f" ] || continue
+            echo ""
+            echo "================================================================"
+            echo "=== $f ($(wc -c < "$f") bytes)"
+            echo "================================================================"
+            cat "$f"
+            echo ""
+            echo "=== EOF $f ==="
+          done
+
       - name: Upload artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: daily-blog-failure-${{ github.run_id }}
-          path: output/
+          path: |
+            output/
+            debug-dumps/
           if-no-files-found: warn
           retention-days: 14

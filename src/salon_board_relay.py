@@ -281,14 +281,20 @@ _USERID_RE = re.compile(r"""['"]?userid['"]?\s*:\s*['"]([^'"]*)['"]""")
 def _parse_login_state(body: str) -> tuple[str, str]:
     """Return (storeid, userid) extracted from sc_data inline JS in the body.
 
-    Either is empty string if not found / not authenticated.
+    Salon Board may emit multiple sc_data blocks on a page. We iterate through
+    all matches and return the *first non-empty* value, so a placeholder
+    ``storeid:''`` earlier in the document doesn't mask the real value
+    appearing later.
+
+    Either field is "" if no non-empty match is found.
     """
-    sid = _STOREID_RE.search(body)
-    uid = _USERID_RE.search(body)
-    return (
-        sid.group(1).strip() if sid else "",
-        uid.group(1).strip() if uid else "",
-    )
+    def _first_nonempty(rx: re.Pattern[str]) -> str:
+        for m in rx.finditer(body):
+            v = m.group(1).strip()
+            if v:
+                return v
+        return ""
+    return _first_nonempty(_STOREID_RE), _first_nonempty(_USERID_RE)
 
 
 def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
@@ -352,13 +358,20 @@ def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
                 storeid, "<masked>" if userid else "<empty>",
             )
             return r
-        # storeid 空 = ログインフォーム再表示 (認証失敗)
+        # storeid 空 = ログインフォーム再表示 / エラー画面 / Akamai challenge 等。
+        # 真因究明のため body を dump (SALON_BOARD_DEBUG_DUMP_DIR が設定されてい
+        # れば) してから raise。
+        _dump_debug_body("login_failed", r.body_text)
+        # title 取得 + body 先頭を error message に含める
+        title_match = re.search(r"<title>([^<]+)</title>", r.body_text)
+        title = title_match.group(1).strip() if title_match else "(no title)"
         body_preview = r.body_text[:400].replace("\n", " ")
         raise RuntimeError(
-            f"Login failed: HTTP 200 but storeid empty (credentials likely wrong). "
-            f"Body preview: {body_preview}"
+            f"Login failed: HTTP 200 but storeid empty. "
+            f"Response title={title!r}. Body preview: {body_preview}"
         )
 
+    _dump_debug_body("login_unexpected_status", r.body_text)
     raise RuntimeError(f"Login: unexpected status {r.status}")
 
 
