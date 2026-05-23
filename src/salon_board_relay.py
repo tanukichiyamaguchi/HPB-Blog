@@ -15,7 +15,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -270,10 +270,12 @@ UNPUBLISH_STAFF_IDS: list[str] = [
 
 # Salon Board は post-login ページに JavaScript 変数 sc_data を inline で埋め込んで、
 # その中に userid と storeid を含める。認証成功なら storeid に実店舗 ID が入る。
-#   未認証: sc_data = { ..., userid : '', storeid : '', ... }
-#   認証済: sc_data = { ..., userid : 'CE12345', storeid : 'H000797013', ... }
-_STOREID_RE = re.compile(r"""storeid\s*:\s*['"]([^'"]*)['"]""")
-_USERID_RE = re.compile(r"""userid\s*:\s*['"]([^'"]*)['"]""")
+# 出力されるフォーマットは画面によって変わるので両方サポートする:
+#   ログイン直後ページ: sc_data = { ..., userid : '', storeid : 'H000797013', ... }
+#   ブログ編集ページ等: sc_data = {..."storeid":"H000797013","userid":"CE12345"...}
+# つまり storeid の後ろに `'` or `"` が来る場合もあれば、来ない場合もある。
+_STOREID_RE = re.compile(r"""['"]?storeid['"]?\s*:\s*['"]([^'"]*)['"]""")
+_USERID_RE = re.compile(r"""['"]?userid['"]?\s*:\s*['"]([^'"]*)['"]""")
 
 
 def _parse_login_state(body: str) -> tuple[str, str]:
@@ -821,3 +823,148 @@ def submit_blog(
 
     log.info("✅ Blog submitted; redirect → %s", r.location)
     return r.location
+
+
+# ----- high-level posting API (used by main.py / cron pipeline) -----
+
+
+# Daily author rotation (one per day). pome(非掲載) is intentionally excluded —
+# Salon Board treats them as non-publishing and they appear in the unPublishStaff
+# hidden field, not in the author select.
+POSTER_ROTATION: tuple[str, ...] = (
+    "momo",
+    "aoi",
+    "ケイト 蒲田西口店",
+)
+
+# Default category for our automation. The blog is always menu-focused so we
+# tag every post as "おすすめメニュー" unless the caller overrides it.
+DEFAULT_CATEGORY_LABEL = "おすすめメニュー"
+
+
+def get_poster_for_date(d: date) -> str:
+    """Return the rotating poster name for the given date (deterministic)."""
+    return POSTER_ROTATION[d.toordinal() % len(POSTER_ROTATION)]
+
+
+@dataclass
+class PostResult:
+    """Outcome of a high-level post operation, serialisable for the sentinel file."""
+    success: bool
+    final_url: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "final_url": self.final_url,
+            "error": self.error,
+        }
+
+
+def _format_body_html(text: str) -> str:
+    """Convert plain-text blog body into the HTML that Salon Board's blogContents1 expects.
+
+    nicEdit (the in-page WYSIWYG) emits ``<p>...</p>`` per paragraph with
+    ``<br />`` for soft line breaks. We mirror that so posts render the same
+    whether typed in the UI or submitted via this relay.
+    """
+    if not text or not text.strip():
+        return ""
+    normalised = text.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", normalised) if p.strip()]
+    return "\n".join(
+        f"<p>{p.replace(chr(10), '<br />')}</p>" for p in paragraphs
+    )
+
+
+def _require_credentials() -> tuple[str, str]:
+    """Return (user_id, password) from env vars, or raise."""
+    user_id = os.environ.get("SALON_BOARD_ID", "").strip()
+    password = os.environ.get("SALON_BOARD_PASSWORD", "").strip()
+    if not user_id or not password:
+        raise RuntimeError(
+            "SALON_BOARD_ID and SALON_BOARD_PASSWORD must both be set."
+        )
+    return user_id, password
+
+
+def post_blog_scheduled(
+    title: str,
+    body: str,
+    image_path: Path | str | None,
+    publish_at: datetime,
+    *,
+    poster: str,
+    category: str = DEFAULT_CATEGORY_LABEL,
+) -> PostResult:
+    """Login + submit one scheduled blog post via the PHP relay.
+
+    This is the high-level entry point used by ``src/main.py`` — it pulls
+    credentials and relay config from env vars (``SALON_BOARD_ID``,
+    ``SALON_BOARD_PASSWORD``, ``RELAY_URL``, ``RELAY_SECRET``) and wraps
+    the full ``login → submit_blog`` flow in a ``PostResult``.
+
+    Args:
+        title: Blog title (Salon Board enforces ≤ 50 chars / ≤ 全角25文字).
+        body: Plain-text body. Gets converted to nicEdit-style HTML.
+        image_path: Optional image to upload as the post's image. ``None``
+            posts without an image.
+        publish_at: Scheduled publication datetime (JST). Must be within
+            Salon Board's ~14-day window and on a 15-min slot outside
+            03:15–08:00.
+        poster: Author display name; must be in ``STAFF_IDS``.
+        category: Category label; must be in ``BLOG_CATEGORY_CODES``.
+
+    Returns:
+        ``PostResult``. On failure, ``error`` carries the underlying message
+        and the caller can decide whether to retry / notify / abort.
+    """
+    if poster not in STAFF_IDS:
+        return PostResult(
+            success=False,
+            error=f"Unknown poster {poster!r}; expected one of {sorted(STAFF_IDS)}",
+        )
+    if category not in BLOG_CATEGORY_CODES:
+        return PostResult(
+            success=False,
+            error=(
+                f"Unknown category {category!r}; expected one of "
+                f"{sorted(BLOG_CATEGORY_CODES)}"
+            ),
+        )
+
+    try:
+        relay_url, relay_secret = get_relay_config()
+        user_id, password = _require_credentials()
+    except RuntimeError as e:
+        return PostResult(success=False, error=str(e))
+
+    staff_id = STAFF_IDS[poster]
+    category_code = BLOG_CATEGORY_CODES[category]
+    body_html = _format_body_html(body)
+    images = [Path(image_path)] if image_path else None
+
+    log.info(
+        "post_blog_scheduled: poster=%s (%s), cat=%s (%s), publish_at=%s, img=%s",
+        poster, staff_id, category, category_code,
+        publish_at.isoformat(),
+        Path(image_path).name if image_path else "<none>",
+    )
+
+    relay = SalonBoardRelay(relay_url, relay_secret)
+    try:
+        login(relay, user_id, password)
+        final_url = submit_blog(
+            relay,
+            title=title,
+            body=body_html,
+            staff_id=staff_id,
+            reserve_dt=publish_at,
+            category_code=category_code,
+            image_paths=images,
+        )
+        return PostResult(success=True, final_url=final_url)
+    except (RuntimeError, ValueError, FileNotFoundError) as e:
+        log.exception("post_blog_scheduled failed: %s", e)
+        return PostResult(success=False, error=str(e))
