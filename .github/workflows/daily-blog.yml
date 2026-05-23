@@ -57,9 +57,16 @@ jobs:
           SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
           SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Optional overrides (Repo Variables)
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          GEMINI_IMAGE_MODEL: ${{ vars.GEMINI_IMAGE_MODEL }}
+          ANTHROPIC_TIMEOUT_SEC: ${{ vars.ANTHROPIC_TIMEOUT_SEC }}
+          GEMINI_TIMEOUT_SEC: ${{ vars.GEMINI_TIMEOUT_SEC }}
+          API_RETRY_ATTEMPTS: ${{ vars.API_RETRY_ATTEMPTS }}
           RUN_SALON_BOARD_POST: schedule
           UPDATE_THEME_HISTORY: "true"
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PYTHONUNBUFFERED: "1"
         run: python -m src.main
 
       - name: Commit theme history

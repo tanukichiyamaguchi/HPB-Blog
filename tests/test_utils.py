@@ -101,3 +101,31 @@ def test_retry_raises_after_max_attempts():
     with pytest.raises(RuntimeError, match="always fails"):
         retry(fn, max_attempts=3, base_delay=0)
     assert calls["n"] == 3
+
+
+def test_env_or_returns_default_for_empty(monkeypatch):
+    from src.config import _env_or
+
+    monkeypatch.setenv("FOO_TEST", "")
+    assert _env_or("FOO_TEST", "default") == "default"
+
+
+def test_env_or_returns_default_for_whitespace(monkeypatch):
+    from src.config import _env_or
+
+    monkeypatch.setenv("FOO_TEST", "   ")
+    assert _env_or("FOO_TEST", "default") == "default"
+
+
+def test_env_or_returns_default_when_unset(monkeypatch):
+    from src.config import _env_or
+
+    monkeypatch.delenv("FOO_TEST", raising=False)
+    assert _env_or("FOO_TEST", "default") == "default"
+
+
+def test_env_or_returns_value_when_set(monkeypatch):
+    from src.config import _env_or
+
+    monkeypatch.setenv("FOO_TEST", "override")
+    assert _env_or("FOO_TEST", "default") == "override"

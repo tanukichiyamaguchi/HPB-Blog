@@ -179,8 +179,29 @@ def _send_failure_notification(stage: str, exc: BaseException) -> None:
     notify_failure(error_message=message, stage=stage, run_url=run_url)
 
 
+def _log_config(log: logging.Logger) -> None:
+    """Dump key config at startup so hangs are diagnosable from CI logs."""
+    from src.config import (
+        ANTHROPIC_TIMEOUT_SEC,
+        API_RETRY_ATTEMPTS,
+        CLAUDE_MODEL,
+        GEMINI_IMAGE_MODEL,
+        GEMINI_TIMEOUT_SEC,
+    )
+    log.info("--- Runtime config ---")
+    log.info("  CLAUDE_MODEL          = %s", CLAUDE_MODEL)
+    log.info("  GEMINI_IMAGE_MODEL    = %s", GEMINI_IMAGE_MODEL)
+    log.info("  ANTHROPIC_TIMEOUT_SEC = %s", ANTHROPIC_TIMEOUT_SEC)
+    log.info("  GEMINI_TIMEOUT_SEC    = %s", GEMINI_TIMEOUT_SEC)
+    log.info("  API_RETRY_ATTEMPTS    = %s", API_RETRY_ATTEMPTS)
+    log.info("  RUN_SALON_BOARD_POST  = %s", _mode())
+    log.info("  UPDATE_THEME_HISTORY  = %s", os.environ.get("UPDATE_THEME_HISTORY", ""))
+    log.info("----------------------")
+
+
 def main() -> int:
     log = setup_logging()
+    _log_config(log)
     mode = _mode()
     now = get_jst_now()
 

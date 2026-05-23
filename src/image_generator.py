@@ -10,7 +10,12 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from src.config import GEMINI_IMAGE_MODEL
+from src.config import (
+    API_RETRY_ATTEMPTS,
+    API_RETRY_BASE_DELAY_SEC,
+    GEMINI_IMAGE_MODEL,
+    GEMINI_TIMEOUT_SEC,
+)
 from src.utils import retry
 
 log = logging.getLogger(__name__)
@@ -114,9 +119,13 @@ def generate_image(
     prompt = build_image_prompt(theme, menu_focus)
     log.info("Generating image (theme=%s, menu=%s)", theme, menu_focus)
 
-    api_client = client or genai.Client(api_key=_require_api_key())
+    api_client = client or genai.Client(
+        api_key=_require_api_key(),
+        http_options=types.HttpOptions(timeout=int(GEMINI_TIMEOUT_SEC * 1000)),
+    )
 
     def _call() -> Any:
+        log.info("Calling Gemini model=%s (timeout=%ss)", GEMINI_IMAGE_MODEL, GEMINI_TIMEOUT_SEC)
         return api_client.models.generate_content(
             model=GEMINI_IMAGE_MODEL,
             contents=prompt,
@@ -125,7 +134,12 @@ def generate_image(
             ),
         )
 
-    response = retry(_call, max_attempts=3, base_delay=2.0, logger=log)
+    response = retry(
+        _call,
+        max_attempts=API_RETRY_ATTEMPTS,
+        base_delay=API_RETRY_BASE_DELAY_SEC,
+        logger=log,
+    )
     image_bytes, mime_type = _extract_image(response)
 
     out_path = out_path_base.with_suffix(_resolve_extension(mime_type))

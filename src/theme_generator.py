@@ -10,6 +10,9 @@ from typing import Any
 from anthropic import Anthropic
 
 from src.config import (
+    ANTHROPIC_TIMEOUT_SEC,
+    API_RETRY_ATTEMPTS,
+    API_RETRY_BASE_DELAY_SEC,
     CLAUDE_MAX_TOKENS_THEME,
     CLAUDE_MODEL,
     MENUS,
@@ -134,7 +137,11 @@ def generate_theme(
         today.strftime("%Y-%m-%d"), menu_focus, season, len(recent),
     )
 
-    api_client = client or Anthropic(api_key=_require_api_key())
+    api_client = client or Anthropic(
+        api_key=_require_api_key(),
+        timeout=ANTHROPIC_TIMEOUT_SEC,
+        max_retries=0,  # we handle retries ourselves
+    )
 
     def _call() -> Any:
         return api_client.messages.create(
@@ -143,7 +150,12 @@ def generate_theme(
             messages=[{"role": "user", "content": user_prompt}],
         )
 
-    message = retry(_call, max_attempts=3, base_delay=2.0, logger=log)
+    message = retry(
+        _call,
+        max_attempts=API_RETRY_ATTEMPTS,
+        base_delay=API_RETRY_BASE_DELAY_SEC,
+        logger=log,
+    )
     raw = _extract_text(message)
     theme = _sanitize_theme(raw)
     if not theme:

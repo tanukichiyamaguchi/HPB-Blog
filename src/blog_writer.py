@@ -10,6 +10,9 @@ from typing import Any
 from anthropic import Anthropic
 
 from src.config import (
+    ANTHROPIC_TIMEOUT_SEC,
+    API_RETRY_ATTEMPTS,
+    API_RETRY_BASE_DELAY_SEC,
     BLOG_PROMPT_PATH,
     CLAUDE_MAX_TOKENS_BLOG,
     CLAUDE_MODEL,
@@ -143,7 +146,11 @@ def generate_blog(theme: str, client: Anthropic | None = None) -> BlogPost:
     )
     log.info("Generating blog body (theme=%s)", theme)
 
-    api_client = client or Anthropic(api_key=_require_api_key())
+    api_client = client or Anthropic(
+        api_key=_require_api_key(),
+        timeout=ANTHROPIC_TIMEOUT_SEC,
+        max_retries=0,  # we handle retries ourselves
+    )
 
     def _call() -> Any:
         return api_client.messages.create(
@@ -153,7 +160,12 @@ def generate_blog(theme: str, client: Anthropic | None = None) -> BlogPost:
             messages=[{"role": "user", "content": user_prompt}],
         )
 
-    message = retry(_call, max_attempts=3, base_delay=2.0, logger=log)
+    message = retry(
+        _call,
+        max_attempts=API_RETRY_ATTEMPTS,
+        base_delay=API_RETRY_BASE_DELAY_SEC,
+        logger=log,
+    )
     raw = _extract_text(message).strip()
     if not raw:
         raise RuntimeError("Claude returned empty blog content")
