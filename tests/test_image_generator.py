@@ -84,23 +84,53 @@ def test_build_image_prompt_lash_lift_maintains_base_cluster():
     assert "基本通り維持" in prompt
 
 
-def test_build_image_prompt_uses_amateur_iphone_style():
-    """User requirement: 素人がiPhoneで撮影したような画質。"""
+def test_build_image_prompt_uses_professional_model_lighting():
+    """User requirement (latest): モデル撮影用ライトでライトアップ。"""
     prompt = build_image_prompt("テーマ", "眉毛WAX")
-    assert "iPhone" in prompt or "スマートフォン" in prompt
-    assert "素人" in prompt
-    # Studio-grade language should be explicitly negated, not promoted
-    assert "プロのスタジオ撮影や雑誌写真のような完璧さは避け" in prompt
-    # Should NOT contain the old "高解像度・フォトグラフィック" upgrade language
-    assert "高解像度" not in prompt
-    assert "フォトグラフィック" not in prompt
+    assert "モデル撮影" in prompt
+    assert "プロライティング" in prompt
+    assert "美容雑誌" in prompt
+    # Old amateur/iPhone language must be gone
+    assert "iPhone" not in prompt
+    assert "素人" not in prompt
+    assert "スマートフォン" not in prompt
+    assert "Instagram" not in prompt
 
 
-def test_build_image_prompt_no_excessive_retouch():
-    """Amateur style: no heavy retouching."""
+def test_build_image_prompt_keeps_natural_skin_texture():
+    """Professional but not over-retouched — natural skin nuance preserved."""
     prompt = build_image_prompt("テーマ", "眉毛WAX")
-    assert "レタッチ" in prompt
-    assert "美肌" in prompt  # "極端な美肌加工なし" etc.
+    # Should still avoid heavy face-tune
+    assert "美肌アプリ" in prompt or "美肌フィルター" in prompt
+    assert "リアル" in prompt
+
+
+def test_build_image_prompt_extreme_close_up_crop():
+    """User requirement: もっと目元のみのアップに。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "片目を中心とした極端な接写" in prompt
+    assert "超クローズアップ" in prompt
+    assert "超拡大率" in prompt
+
+
+def test_build_image_prompt_no_visible_brow_pores():
+    """User requirement: 眉周りの黒い毛穴は無いように。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "黒い毛穴" in prompt
+    assert "陶器のように" in prompt or "陶器" in prompt
+    # The instruction must be a negation (no pores), not just "pores"
+    assert "毛穴・黒い点" in prompt or "黒い毛穴・黒い点" in prompt
+
+
+def test_build_image_prompt_neat_organized_lash_bundles():
+    """User requirement: まつ毛をきれいな毛流れの束感に整える（バラバラはNG）。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "整然と" in prompt
+    assert "規則的な束" in prompt
+    # Must reject the previous "random" cluster wording
+    assert "ランダムに" not in prompt
+    # Must explicitly forbid scattered hairs
+    assert "バラバラに散らばった毛は一切なし" in prompt
 
 
 def test_build_image_prompt_varies_by_seed():
