@@ -486,19 +486,30 @@ def is_logged_in_after(
 # ----- blog submission (input → confirm → reflect) -----
 
 
-# Struts CSRF token: hidden <input> appearing on every form-bearing page.
-# The value changes on every render — the confirm response carries a *new* token
-# that doReflectComplete requires.
-_CSRF_RE = re.compile(
-    r'<input[^>]*name="org\.apache\.struts\.taglib\.html\.TOKEN"[^>]*value="([^"]+)"',
-    re.IGNORECASE,
-)
-# Per-tab nonce that Salon Board uses to detect "form opened in multiple tabs"
-# situations. Unchanged across the input → confirm → reflect chain.
-_STORE_TAB_RE = re.compile(
-    r'<input[^>]*name="storeIdForMultipleTabCheck"[^>]*value="([^"]+)"',
-    re.IGNORECASE,
-)
+# Struts CSRF token + per-tab nonce.
+# These tokens live on every form-bearing page. The CSRF value rotates on every
+# render — the confirm response carries a *new* CSRF that doReflectComplete
+# requires. The storeIdForMultipleTabCheck stays constant across input → confirm
+# → reflect (it's a per-tab session marker, not anti-CSRF).
+#
+# Real-world Salon Board HTML can emit attributes in either order
+# (name-then-value OR value-then-name) and may use single OR double quotes,
+# so we try several extraction patterns.
+def _hidden_field(body: str, field_name: str) -> str | None:
+    """Extract a hidden <input> value by field name, tolerant to attr ordering."""
+    fn = re.escape(field_name)
+    patterns = (
+        # name="x" ... value="..."
+        rf'<input[^>]*name=(["\']){fn}\1[^>]*value=(["\'])([^"\']*)\2',
+        # value="..." ... name="x"
+        rf'<input[^>]*value=(["\'])([^"\']*)\1[^>]*name=(["\']){fn}\3',
+    )
+    for i, pat in enumerate(patterns):
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            # group index depends on which pattern matched
+            return m.group(3) if i == 0 else m.group(2)
+    return None
 
 
 def _parse_form_tokens(body: str) -> tuple[str, str]:
@@ -506,14 +517,33 @@ def _parse_form_tokens(body: str) -> tuple[str, str]:
 
     Raises RuntimeError if either field is missing.
     """
-    csrf = _CSRF_RE.search(body)
-    tab = _STORE_TAB_RE.search(body)
+    csrf = _hidden_field(body, "org.apache.struts.taglib.html.TOKEN")
+    tab = _hidden_field(body, "storeIdForMultipleTabCheck")
     if not csrf or not tab:
         raise RuntimeError(
             "Failed to parse form tokens "
             f"(csrf_found={bool(csrf)}, tab_found={bool(tab)})"
         )
-    return csrf.group(1), tab.group(1)
+    return csrf, tab
+
+
+def _dump_debug_body(label: str, body: str) -> str | None:
+    """If SALON_BOARD_DEBUG_DUMP_DIR is set, write body to <dir>/<label>.html.
+
+    Returns the path written, or None.
+    """
+    dump_dir = os.environ.get("SALON_BOARD_DEBUG_DUMP_DIR", "").strip()
+    if not dump_dir:
+        return None
+    try:
+        Path(dump_dir).mkdir(parents=True, exist_ok=True)
+        path = Path(dump_dir) / f"{label}.html"
+        path.write_text(body, encoding="utf-8", errors="replace")
+        log.info("Dumped %s response body → %s (%d chars)", label, path, len(body))
+        return str(path)
+    except OSError as e:
+        log.warning("Failed to dump %s body: %s", label, e)
+        return None
 
 
 def submit_blog(
@@ -630,20 +660,36 @@ def submit_blog(
         follow_redirects=False,
     )
     if r.status != 200:
+        _dump_debug_body("confirm_failed", r.body_text)
         preview = r.body_text[:400].replace("\n", " ")
         raise RuntimeError(f"Confirm failed: HTTP {r.status}. Body: {preview}")
 
-    # 確認画面に「修正」「戻る」が出ていなければバリデーションエラー画面の可能性
-    if "id=\"reflect\"" not in r.body_text and "reflect" not in r.body_text.lower():
+    # 確認画面の判定。reflect ボタン (id="reflect") の有無で見る。
+    # 「修正」「戻る」が出ない場合はバリデーションエラー画面 or 二重送信検出画面の可能性
+    if 'id="reflect"' not in r.body_text and "id='reflect'" not in r.body_text:
+        _dump_debug_body("confirm_no_reflect", r.body_text)
         # エラーメッセージ抽出（class="error" や赤字 div 想定; 取れなければ本文先頭）
         err_match = re.search(
-            r'<(?:span|div|p)[^>]*(?:class|id)="[^"]*err[^"]*"[^>]*>([^<]+)',
+            r'<(?:span|div|p)[^>]*(?:class|id)="[^"]*(?:err|error|alert)[^"]*"[^>]*>\s*([^<]+)',
             r.body_text, re.IGNORECASE,
         )
-        msg = err_match.group(1).strip() if err_match else r.body_text[:300]
+        msg = err_match.group(1).strip() if err_match else r.body_text[:400]
         raise RuntimeError(f"Confirm rejected the form: {msg}")
 
-    csrf_new, tab_new = _parse_form_tokens(r.body_text)
+    try:
+        csrf_new, tab_new = _parse_form_tokens(r.body_text)
+    except RuntimeError:
+        _dump_debug_body("confirm_unparseable", r.body_text)
+        # body 内に TOKEN という文字列があれば見つかった位置周辺をエラーに含めて返す
+        idx = r.body_text.find("TOKEN")
+        context = (
+            r.body_text[max(0, idx - 80) : idx + 200].replace("\n", " ")
+            if idx >= 0 else "(TOKEN string not found in body)"
+        )
+        raise RuntimeError(
+            "Confirm response has id=\"reflect\" but token parser failed. "
+            f"TOKEN context: ...{context}..."
+        )
     log.info(
         "  Confirm OK; new tokens: csrf=%s..., tab=%s...",
         csrf_new[:8], tab_new[:8],
