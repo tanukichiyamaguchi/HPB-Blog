@@ -60,6 +60,10 @@ CLAUDE_MAX_TOKENS_BLOG = 4096
 # half-width chars).
 MAX_TITLE_LENGTH = 25
 
+# Total body length cap (LLM-generated content + auto-appended signature).
+# User requirement: 絶対に 1000 文字以下.
+MAX_BODY_LENGTH = 1000
+
 # Canonical salon signature. Always appended to every blog body so the LLM
 # cannot truncate or omit it. Keep wording byte-identical to the README spec.
 SALON_SIGNATURE = (

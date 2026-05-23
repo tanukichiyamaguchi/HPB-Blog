@@ -7,13 +7,15 @@ from src.blog_writer import (
     BlogPost,
     _parse_keywords,
     _parse_sections,
+    enforce_body_length,
     enforce_title_length,
     ensure_signature,
     generate_blog,
     parse_blog,
     strip_emoji,
+    strip_partial_signature,
 )
-from src.config import MAX_TITLE_LENGTH, SALON_SIGNATURE
+from src.config import MAX_BODY_LENGTH, MAX_TITLE_LENGTH, SALON_SIGNATURE
 
 
 SAMPLE_OUTPUT = """---
@@ -230,6 +232,99 @@ def test_parse_blog_keeps_short_clean_title_intact():
 """
     post = parse_blog(raw)
     assert post.title == "蒲田駅西口♪眉毛WAXで美眉"
+
+
+def test_strip_partial_signature_removes_partial():
+    body = (
+        "本文。\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "KATEstageLASH(ケイトステージラッシュ) 蒲田西口店\n"
+    )
+    out = strip_partial_signature(body)
+    assert out == "本文。"
+    assert "━━━" not in out
+    assert "KATEstageLASH" not in out
+
+
+def test_strip_partial_signature_no_op_when_clean():
+    body = "純粋な本文だけ。"
+    assert strip_partial_signature(body) == "純粋な本文だけ。"
+
+
+def test_enforce_body_length_no_change_when_short():
+    short = "本文" * 50  # 100 chars
+    out = enforce_body_length(short)
+    assert out == short
+
+
+def test_enforce_body_length_truncates_long_content():
+    long_content = "とても長い本文の内容です。" * 100  # ~1300 chars
+    out = enforce_body_length(long_content)
+    # After truncation, content + signature must fit ≤ MAX_BODY_LENGTH
+    # so content itself must be ≤ MAX_BODY_LENGTH - signature - separator
+    from src.blog_writer import _SIGNATURE_RESERVED_CHARS
+
+    assert len(out) <= MAX_BODY_LENGTH - _SIGNATURE_RESERVED_CHARS
+
+
+def test_enforce_body_length_prefers_sentence_boundary():
+    content = "一つ目の文。" * 20 + "二つ目。" * 100  # 120 + 400 chars
+    out = enforce_body_length(content)
+    # Should not end mid-word; expect to end with 。 or 、 or 一文区切り
+    assert out.rstrip().endswith(("。", "、", "！", "♪")) or len(out) == 0
+
+
+def test_parse_blog_total_length_within_1000():
+    long_body = "とても長い本文の内容です。" * 100  # ~1300 chars
+    raw = f"""◆タイトル：
+タイトル
+
+◆使用キーワード：
+蒲田
+
+◆本文：
+{long_body}
+"""
+    post = parse_blog(raw)
+    assert len(post.body) <= MAX_BODY_LENGTH, (
+        f"Body is {len(post.body)} chars; must be ≤ {MAX_BODY_LENGTH}"
+    )
+
+
+def test_parse_blog_preserves_signature_when_truncating():
+    long_body = "本文の内容。" * 200
+    raw = f"""◆タイトル：
+タイトル
+
+◆使用キーワード：
+蒲田
+
+◆本文：
+{long_body}
+"""
+    post = parse_blog(raw)
+    # Total bounded
+    assert len(post.body) <= MAX_BODY_LENGTH
+    # Signature still intact (not truncated)
+    assert "◆住所〒144-0051" in post.body
+    assert "◆営業時間9:00~20:00" in post.body
+    assert "#蒲田駅西口" in post.body
+    assert post.body.endswith(SALON_SIGNATURE)
+
+
+def test_parse_blog_short_content_unchanged():
+    short_raw = """◆タイトル：
+短いタイトル
+
+◆使用キーワード：
+蒲田
+
+◆本文：
+短い本文の内容です。
+"""
+    post = parse_blog(short_raw)
+    assert "短い本文の内容です。" in post.body
+    assert len(post.body) <= MAX_BODY_LENGTH
 
 
 def test_ensure_signature_appends_when_missing():

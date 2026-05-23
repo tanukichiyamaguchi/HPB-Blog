@@ -108,9 +108,23 @@ def test_build_image_prompt_keeps_natural_skin_texture():
 def test_build_image_prompt_extreme_close_up_crop():
     """User requirement: もっと目元のみのアップに。"""
     prompt = build_image_prompt("テーマ", "眉毛WAX")
-    assert "片目を中心とした極端な接写" in prompt
+    assert "片目を中心" in prompt
     assert "超クローズアップ" in prompt
     assert "超拡大率" in prompt
+
+
+def test_build_image_prompt_two_panel_collage():
+    """User requirement: 添付画像のように二分割になるように。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "2分割" in prompt
+    assert "上パネル" in prompt
+    assert "下パネル" in prompt
+    assert "縦長" in prompt
+    # Must NOT be a before/after comparison
+    assert "before" not in prompt.lower()
+    assert "after" not in prompt.lower()
+    assert "ビフォー" not in prompt
+    assert "アフター" not in prompt
 
 
 def test_build_image_prompt_no_visible_brow_pores():

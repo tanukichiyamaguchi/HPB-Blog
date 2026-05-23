@@ -16,6 +16,7 @@ from src.config import (
     BLOG_PROMPT_PATH,
     CLAUDE_MAX_TOKENS_BLOG,
     CLAUDE_MODEL,
+    MAX_BODY_LENGTH,
     MAX_TITLE_LENGTH,
     SALON_SIGNATURE,
     SIGNATURE_HORIZONTAL_RULE,
@@ -122,6 +123,45 @@ def enforce_title_length(title: str, max_len: int = MAX_TITLE_LENGTH) -> str:
     return candidate.rstrip()
 
 
+_SIGNATURE_SEPARATOR = "\n\n"
+# Char budget reserved for the canonical signature (separator + signature itself).
+_SIGNATURE_RESERVED_CHARS = len(_SIGNATURE_SEPARATOR) + len(SALON_SIGNATURE)
+# Char budget left for the LLM-generated body content.
+MAX_BODY_CONTENT_LENGTH = max(0, MAX_BODY_LENGTH - _SIGNATURE_RESERVED_CHARS)
+
+
+def strip_partial_signature(body: str) -> str:
+    """Drop anything from the first horizontal-rule line onward.
+
+    LLMs frequently emit only the header part of the signature; this normalizes
+    the body so we can re-append the canonical signature without duplication.
+    """
+    body = body.rstrip()
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if SIGNATURE_HORIZONTAL_RULE in line:
+            return "\n".join(lines[:i]).rstrip()
+    return body
+
+
+def enforce_body_length(content: str, max_total: int = MAX_BODY_LENGTH) -> str:
+    """Truncate body content so the eventual ``content + signature`` ≤ ``max_total``.
+
+    Pass the body WITHOUT the signature; the function deducts the signature's
+    reserved char budget and cuts at the most natural boundary that fits.
+    """
+    budget = max(0, max_total - _SIGNATURE_RESERVED_CHARS)
+    if len(content) <= budget:
+        return content
+    candidate = content[:budget]
+    # Prefer paragraph-level boundaries, then sentence, then comma.
+    for sep in ("\n\n", "。\n", "！\n", "♪\n", "。", "！", "♪", "\n", "、"):
+        idx = candidate.rfind(sep)
+        if idx >= budget // 2:
+            return candidate[: idx + len(sep)].rstrip()
+    return candidate.rstrip()
+
+
 def ensure_signature(body: str) -> str:
     """Strip any partial signature the LLM may have produced and append the canonical one.
 
@@ -129,16 +169,8 @@ def ensure_signature(body: str) -> str:
     missing address/hours/hashtags). To guarantee a complete signature, we cut the body
     at the first horizontal-rule line and append the full canonical signature.
     """
-    body = body.rstrip()
-    lines = body.splitlines()
-    truncate_idx: int | None = None
-    for i, line in enumerate(lines):
-        if SIGNATURE_HORIZONTAL_RULE in line:
-            truncate_idx = i
-            break
-    if truncate_idx is not None:
-        body = "\n".join(lines[:truncate_idx]).rstrip()
-    return body + "\n\n" + SALON_SIGNATURE
+    stripped = strip_partial_signature(body)
+    return stripped + _SIGNATURE_SEPARATOR + SALON_SIGNATURE
 
 
 def parse_blog(raw: str) -> BlogPost:
@@ -178,7 +210,19 @@ def parse_blog(raw: str) -> BlogPost:
         )
         title = enforce_title_length(title)
 
-    body = ensure_signature(body)
+    # Strip any partial signature first so we measure only the LLM-written content,
+    # then enforce body length so (content + canonical signature) ≤ MAX_BODY_LENGTH.
+    body_content = strip_partial_signature(body)
+    if len(body_content) > MAX_BODY_CONTENT_LENGTH:
+        original_len = len(body_content)
+        body_content = enforce_body_length(body_content)
+        log.warning(
+            "Body content %d > %d chars; truncated to %d (signature %d will be appended → total %d ≤ %d)",
+            original_len, MAX_BODY_CONTENT_LENGTH, len(body_content),
+            _SIGNATURE_RESERVED_CHARS, len(body_content) + _SIGNATURE_RESERVED_CHARS, MAX_BODY_LENGTH,
+        )
+    body = body_content + _SIGNATURE_SEPARATOR + SALON_SIGNATURE
+    assert len(body) <= MAX_BODY_LENGTH, f"body length {len(body)} exceeds {MAX_BODY_LENGTH}"
 
     return BlogPost(title=title, keywords=keywords, body=body, raw=raw)
 
