@@ -106,11 +106,26 @@ LOGIN_PW_SELECTORS: tuple[str, ...] = (
     "input[type='password']:visible",
 )
 LOGIN_SUBMIT_SELECTORS: tuple[str, ...] = (
+    # Most specific first — the exact Salon Board primary button class.
     "a.common-CNCcommon__primaryBtn:has-text('ログイン')",
+    "a.common-CNCcommon__primaryBtn",
+    # JS-bound anchor (no href, onclick handler)
+    "a[onclick*='login' i]",
+    "a[onclick*='submit' i]",
+    # Text-based matches (exact then contains)
     "a:text-is('ログイン')",
     "button:text-is('ログイン')",
-    "input[type='submit'][value='ログイン']",
-    "button:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない'))",
+    "a:has-text('ログイン')",
+    "button:has-text('ログイン')",
+    # Standard form submits
+    "input[type='submit'][value*='ログイン']",
+    "input[type='submit']",
+    "button[type='submit']",
+    "form button:not([type='button'])",
+    # As a wide net, any clickable element whose text starts with ログイン
+    # (avoiding "ログインできない" or "ログインでお困り" help links).
+    "a:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない')):not(:has-text('忘れ'))",
+    "button:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない')):not(:has-text('忘れ'))",
 )
 
 POSTER_SELECT_SELECTORS: tuple[str, ...] = (
@@ -424,6 +439,71 @@ class SalonBoardPoster:
         log.warning("Could not click %s with any of %d selectors", label, len(selectors))
         return False
 
+    def _dump_form_html(self, page: Page, label: str) -> None:
+        """Save the relevant form's outerHTML so selector mismatches can be diagnosed.
+
+        Persisted to ``screenshots_dir/<label>_form.html`` and the first 1500
+        characters are logged inline so artifact download isn't required.
+        """
+        try:
+            # Get the form that contains the password input (most reliable anchor).
+            html = page.evaluate(
+                """() => {
+                    const pw = document.querySelector("input[type='password'], input[name='password']");
+                    const form = pw && pw.closest('form');
+                    return form ? form.outerHTML : document.body.outerHTML.slice(0, 8000);
+                }"""
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Failed to dump form HTML: %s", e)
+            return
+        try:
+            self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+            path = self.screenshots_dir / f"{label}_form.html"
+            path.write_text(html or "", encoding="utf-8")
+            log.warning("Dumped %s form HTML to %s (%d chars)", label, path, len(html or ""))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Failed to write form HTML: %s", e)
+        # Also log a truncated preview so we don't have to wait for artifact download
+        preview = (html or "")[:1500].replace("\n", " ")
+        log.warning("=== %s_form HTML preview (first 1500 chars) ===", label)
+        log.warning(preview)
+        log.warning("=== end %s_form HTML preview ===", label)
+
+    def _try_js_submit_login(self, page: Page) -> bool:
+        """Last-resort: programmatically submit the login form via JavaScript.
+
+        Many Salon Board / Akamai-protected sites bind login to an <a> onclick
+        handler rather than a submit button. If our selector list can't find the
+        right element, we instead call form.submit() directly. Returns True if
+        navigation away from the login page occurred.
+        """
+        login_url_prefix = SALON_BOARD_LOGIN_URL.rstrip("/")
+        try:
+            result = page.evaluate(
+                """() => {
+                    const pw = document.querySelector("input[type='password'], input[name='password']");
+                    const form = pw && pw.closest('form');
+                    if (!form) return {ok: false, reason: 'no-form'};
+                    try { form.submit(); return {ok: true}; }
+                    catch (e) { return {ok: false, reason: String(e)}; }
+                }"""
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("JS form.submit() raised: %s", e)
+            return False
+        if not result or not result.get("ok"):
+            log.warning("JS form.submit() did not run: %s", result)
+            return False
+        # Wait briefly for navigation. We don't strictly need wait_for_url here —
+        # success is indicated by URL leaving the login path.
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+        except Exception:  # noqa: BLE001
+            pass
+        current = page.url.split("?")[0].split("#")[0].rstrip("/")
+        return current != login_url_prefix
+
     def _try_select(
         self,
         page: Page,
@@ -724,7 +804,13 @@ class SalonBoardPoster:
         # Password fields are masked by the browser, but the ID field is not.
 
         if not self._try_click(page, LOGIN_SUBMIT_SELECTORS, "login_submit"):
-            raise RuntimeError("Could not locate login submit button")
+            # Dump the form HTML to help diagnose missing selectors, then
+            # attempt JS-level form submission as a last resort.
+            self._dump_form_html(page, "login")
+            if self._try_js_submit_login(page):
+                log.info("login_submit: succeeded via JS form.submit() fallback")
+            else:
+                raise RuntimeError("Could not locate login submit button")
         self._wait_idle(page)
         self._screenshot(page, "03_after_login")
 
