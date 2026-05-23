@@ -121,11 +121,35 @@ python -m src.main
 4. **薬機法配慮**。効果効能の断定表現を避けます。
 5. **GitHub Actions の遅延**を見込み、公開時刻には十分な余裕を確保しています。
 
+## 動作モード（環境変数）
+
+`src/main.py` は環境変数で挙動を切り替えます。
+
+| 環境変数 | 値 | 効果 |
+|---------|----|----|
+| `RUN_SALON_BOARD_POST` | `skip`（既定） | AI生成のみ。サロンボード操作なし。 |
+| `RUN_SALON_BOARD_POST` | `draft` | サロンボードへ下書き保存（Phase 3 検証用） |
+| `RUN_SALON_BOARD_POST` | `schedule` | 翌朝 8:15 JST の予約投稿として保存（本番用） |
+| `UPDATE_THEME_HISTORY` | `true` | サロンボード成功後に `data/theme_history.json` へ追記 |
+| `SLACK_WEBHOOK_URL` | URL | 成功/失敗で Slack 通知（未設定なら通知スキップ） |
+| `GITHUB_RUN_URL` | URL | 失敗通知に Actions Run URL を載せる |
+
+## 本番 cron 有効化手順
+
+`.github/workflows/daily-blog.yml` は安全ガードあり：
+
+1. cron スケジュールは `15 13 * * *`（JST 22:15）で記載済み
+2. ただし job-level `if` で **`vars.ENABLE_DAILY_CRON == 'true'`** をチェック
+3. 本番稼働には GitHub Repo `Settings → Variables → Actions` で `ENABLE_DAILY_CRON=true` を登録
+4. 未登録の間、cron が起動してもジョブはスキップされる
+
+`workflow_dispatch`（手動 trigger）は常に動作するため、Phase 6 の1週間検証はそれで実施できます。
+
 ## 開発ステータス
 
 - [x] Phase 1: 基本セットアップ
-- [ ] Phase 2: AI生成パート（テーマ／本文／画像）
-- [ ] Phase 3: サロンボード自動操作
-- [ ] Phase 4: Slack通知統合
-- [ ] Phase 5: 本番ワークフロー統合
-- [ ] Phase 6: 本番運用前の最終確認
+- [x] Phase 2: AI生成パート（テーマ／本文／画像）
+- [x] Phase 3: サロンボード自動操作（下書き保存）
+- [x] Phase 4: Slack通知統合
+- [x] Phase 5: 本番ワークフロー統合
+- [ ] Phase 6: 本番運用前の最終確認（実機での selector 検証＋1週間稼働）
