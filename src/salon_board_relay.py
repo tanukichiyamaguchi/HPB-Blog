@@ -200,14 +200,38 @@ SALON_BOARD_LOGIN_URL = "https://salonboard.com/login/"
 SALON_BOARD_LOGIN_POST_URL = "https://salonboard.com/CNC/login/doLogin/"
 
 
+# Salon Board は post-login ページに JavaScript 変数 sc_data を inline で埋め込んで、
+# その中に userid と storeid を含める。認証成功なら storeid に実店舗 ID が入る。
+#   未認証: sc_data = { ..., userid : '', storeid : '', ... }
+#   認証済: sc_data = { ..., userid : 'CE12345', storeid : 'H000797013', ... }
+_STOREID_RE = re.compile(r"""storeid\s*:\s*['"]([^'"]*)['"]""")
+_USERID_RE = re.compile(r"""userid\s*:\s*['"]([^'"]*)['"]""")
+
+
+def _parse_login_state(body: str) -> tuple[str, str]:
+    """Return (storeid, userid) extracted from sc_data inline JS in the body.
+
+    Either is empty string if not found / not authenticated.
+    """
+    sid = _STOREID_RE.search(body)
+    uid = _USERID_RE.search(body)
+    return (
+        sid.group(1).strip() if sid else "",
+        uid.group(1).strip() if uid else "",
+    )
+
+
 def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
     """salonboard.com にリレー経由でログインする.
 
+    Salon Board は HTTP 302 redirect ではなく HTTP 200 で post-login ページを直接
+    返す設計。認証判定は応答ボディ内 ``sc_data`` の ``storeid`` が非空かどうかで行う。
+
     Returns:
-        RelayResponse: POST /CNC/login/doLogin/ のレスポンス（302 が成功）
+        RelayResponse: POST /CNC/login/doLogin/ のレスポンス
 
     Raises:
-        RuntimeError: 認証失敗（200 で /login 再表示など）
+        RuntimeError: 認証失敗（storeid が空 or /login にリダイレクト等）
     """
     # 1. GET login page (Akamai cookies の seed)
     log.info("Relay login: GET %s", SALON_BOARD_LOGIN_URL)
@@ -241,22 +265,29 @@ def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
         r.status, r.location, r.elapsed_seconds, list(relay.cookies.keys()),
     )
 
-    # 成功判定: 302 redirect で /login 以外に飛ばされる
+    # 認証判定 1: 302 redirect で /login 以外への遷移
     if r.status in (301, 302, 303):
         if r.location and "login" not in r.location.lower():
-            log.info("✅ Login successful, redirect to: %s", r.location)
+            log.info("✅ Login successful via redirect to: %s", r.location)
             return r
-        log.error(
-            "Login redirected to login-related URL (creds likely wrong): %r",
-            r.location,
-        )
-        raise RuntimeError(f"Login failed: redirected back to {r.location}")
+        raise RuntimeError(f"Login failed: redirected back to {r.location!r}")
 
-    # HTTP 200 = ログインページ再表示 (認証失敗 or 中間応答)
+    # 認証判定 2: HTTP 200 で body の sc_data に storeid が入っているかをチェック
+    # Salon Board は redirect せず post-login ページを直接返してくる
     if r.status == 200:
-        body_preview = r.body_text[:600].replace("\n", " ")
-        log.error("Login POST returned 200 (no redirect). Body preview: %s", body_preview)
-        raise RuntimeError("Login failed: server returned 200, likely auth rejected")
+        storeid, userid = _parse_login_state(r.body_text)
+        if storeid:
+            log.info(
+                "✅ Login successful (HTTP 200 with sc_data): storeid=%s, userid=%s",
+                storeid, "<masked>" if userid else "<empty>",
+            )
+            return r
+        # storeid 空 = ログインフォーム再表示 (認証失敗)
+        body_preview = r.body_text[:400].replace("\n", " ")
+        raise RuntimeError(
+            f"Login failed: HTTP 200 but storeid empty (credentials likely wrong). "
+            f"Body preview: {body_preview}"
+        )
 
     raise RuntimeError(f"Login: unexpected status {r.status}")
 
@@ -264,8 +295,7 @@ def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
 def is_logged_in_after(relay: SalonBoardRelay, probe_url: str = "https://salonboard.com/KLP/blog/blog/") -> bool:
     """ログイン後、保護領域にアクセスできるか確認。
 
-    認証成功なら 200 でブログ作成画面が返るはず。未認証なら login にリダイレクト or
-    エラーページが返る。
+    認証成功なら sc_data に storeid が入っている。
     """
     log.info("Auth probe: GET %s", probe_url)
     try:
@@ -279,10 +309,17 @@ def is_logged_in_after(relay: SalonBoardRelay, probe_url: str = "https://salonbo
     if r.status in (301, 302) and "login" in (r.location or "").lower():
         log.warning("Probe redirected to login → not authenticated")
         return False
-    if r.status == 200 and "ログイン" in r.body_text[:2000] and "パスワード" in r.body_text[:2000]:
-        log.warning("Probe body looks like login form → not authenticated")
+    if r.status != 200:
+        log.warning("Probe returned non-200 status → likely not authenticated")
         return False
-    if r.status == 404 or "エラー" in r.body_text[:500]:
-        log.warning("Probe returned error page → likely not authenticated")
-        return False
-    return True
+
+    storeid, userid = _parse_login_state(r.body_text)
+    if storeid:
+        log.info("✅ Probe confirms authenticated state: storeid=%s", storeid)
+        return True
+    log.warning(
+        "Probe body has no storeid in sc_data → likely not authenticated. Title hint: %s",
+        (re.search(r"<title>([^<]+)</title>", r.body_text) or [None, "(no title)"])[1]
+        if re.search(r"<title>([^<]+)</title>", r.body_text) else "(no title)",
+    )
+    return False
