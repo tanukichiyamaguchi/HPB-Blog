@@ -145,6 +145,16 @@ python -m src.main
 `daily-blog.yml` の cron 値を編集してください（UTC 表記）。
 例：JST 22:15 = UTC 13:15 → `cron: '15 13 * * *'`
 
+## ネットワーク診断
+
+GitHub Actions IPからサロンボードへの到達性を確認するための診断ワークフロー。
+
+実行方法：
+1. GitHub リポジトリの **Actions** タブを開く
+2. 左メニューから **Network Diagnostic** を選択
+3. **Run workflow** ボタンをクリック
+4. 実行完了後、ログを確認
+
 ## トラブルシューティング
 
 ### Salon Board に接続できない（GitHub Actions ランナーから）

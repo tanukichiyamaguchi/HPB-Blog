@@ -1,0 +1,94 @@
+name: Network Diagnostic
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Runner location info
+        run: |
+          echo "=== Runner public IP & location ==="
+          IP=$(curl -s https://api.ipify.org)
+          echo "Public IP: $IP"
+          echo "Geo info:"
+          curl -s "https://ipinfo.io/$IP" || echo "ipinfo failed"
+          echo ""
+
+      - name: Test JP general sites (control group)
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+          echo "=== [1] Yahoo Japan ==="
+          curl -I -s -o /dev/null -w "HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 30 -A "$UA" https://www.yahoo.co.jp/ \
+            && echo "✅ Yahoo JP OK" || echo "❌ Yahoo JP Failed"
+
+          echo ""
+          echo "=== [2] Recruit corporate site ==="
+          curl -I -s -o /dev/null -w "HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 30 -A "$UA" https://www.recruit.co.jp/ \
+            && echo "✅ Recruit OK" || echo "❌ Recruit Failed"
+
+          echo ""
+          echo "=== [3] HotPepper Beauty (consumer site) ==="
+          curl -I -s -o /dev/null -w "HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 30 -A "$UA" https://beauty.hotpepper.jp/ \
+            && echo "✅ HPB OK" || echo "❌ HPB Failed"
+
+      - name: Test salonboard.com (target)
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+          echo "=== [4] salonboard.com (default UA) ==="
+          curl -I -s -o /dev/null -w "HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 30 https://salonboard.com/login/ \
+            && echo "✅ Default UA OK" || echo "❌ Default UA Failed"
+
+          echo ""
+          echo "=== [5] salonboard.com (Chrome UA) ==="
+          curl -I -s -o /dev/null -w "HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 30 -A "$UA" https://salonboard.com/login/ \
+            && echo "✅ Chrome UA OK" || echo "❌ Chrome UA Failed"
+
+          echo ""
+          echo "=== [6] salonboard.com via Python requests ==="
+          python3 -c "
+          import requests, time
+          start = time.time()
+          try:
+              r = requests.get('https://salonboard.com/login/', timeout=30, headers={
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+              })
+              print(f'✅ Status: {r.status_code}, Time: {time.time()-start:.2f}s')
+              print(f'Server header: {r.headers.get(\"Server\", \"N/A\")}')
+          except requests.exceptions.Timeout:
+              print(f'❌ Timeout after {time.time()-start:.2f}s')
+          except Exception as e:
+              print(f'❌ Error: {type(e).__name__}: {e}')
+          " || true
+
+      - name: DNS & TLS check
+        run: |
+          echo "=== [7] DNS resolution ==="
+          dig salonboard.com +short || nslookup salonboard.com
+
+          echo ""
+          echo "=== [8] TLS handshake to salonboard.com:443 ==="
+          timeout 20 openssl s_client -connect salonboard.com:443 -servername salonboard.com </dev/null 2>&1 | head -5 || echo "❌ TLS handshake failed"
+
+      - name: Summary
+        run: |
+          echo ""
+          echo "================================="
+          echo "📊 SUMMARY"
+          echo "================================="
+          echo "If [1][2][3] (Japanese sites) succeeded but [4][5][6] (salonboard) all timed out,"
+          echo "→ IP block by salonboard.com is CONFIRMED."
+          echo ""
+          echo "If [7] DNS resolved but [8] TLS failed,"
+          echo "→ Firewall/IP-level block at network layer."
+          echo ""
+          echo "If [4] returned HTTP 403/429,"
+          echo "→ Application-layer block (still blocked, but different mechanism)."
