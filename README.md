@@ -11,20 +11,26 @@
 GitHub Actions ランナーは米国IPで salonboard.com への接続が遮断されるため、
 サロンボードへの自動投稿は **日本IPから実行する必要** があります。
 
-### 🔵 推奨: 日本VPSで完全クラウド運用
+### 🔵 推奨: Oracle Cloud Tokyo Always Free（**永久無料・ブラウザのみ**）
 
-日本リージョンのVPS（お名前.com VPS／さくらVPS等、月¥500〜700）上で
+完全無料の Oracle Cloud Tokyo Always Free Tier 上に Ubuntu VM を立て、
 **Linux cron が JST 22:15 に毎日自動実行** → 翌朝8:15 公開予約。
-PCには何もインストール不要、すべてブラウザのWebコンソールで操作。
+セットアップから運用まで **ブラウザのみ**（PCへのインストール一切不要）。
 
-セットアップは **[docs/VPS_SETUP.md](docs/VPS_SETUP.md)** を参照（所要60〜90分）。
+セットアップは **[docs/ORACLE_CLOUD_SETUP.md](docs/ORACLE_CLOUD_SETUP.md)** を参照（所要1.5〜2時間）。
 
+VM 内ブラウザ Cloud Shell で以下を貼るだけで自動セットアップ:
 ```bash
-# VPS の Web コンソールで以下を1行貼るだけで自動セットアップ
 curl -fsSL https://raw.githubusercontent.com/tanukichiyamaguchi/HPB-Blog/main/scripts/install_on_vps.sh | bash
 ```
 
-### 🟡 代替: Windows PC で週次バッチ
+### 🟡 代替: 有料VPS（日本リージョン）
+
+お名前.com VPS（¥520〜）/ さくらのVPS（¥683〜）/ Conoha VPS（¥483〜）。
+セットアップ手順は **[docs/VPS_SETUP.md](docs/VPS_SETUP.md)**。
+Oracle Cloud で Out of Capacity が続く場合や安定運用を求める場合の選択肢。
+
+### 🟢 代替: Windows PC で週次バッチ
 
 サロン PC で **週1回 `run_weekly.bat` をダブルクリック**、**7日分の予約投稿**
 を一括で登録する方式。コスト無料だが PC への Python 環境構築が必要。
