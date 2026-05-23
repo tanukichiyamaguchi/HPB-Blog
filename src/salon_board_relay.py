@@ -15,6 +15,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -207,6 +208,12 @@ SALON_BOARD_BLOG_NEW_URL = "https://salonboard.com/KLP/blog/blog/"
 #   POST multipart/form-data, single field "formFile"=<binary>
 #   Response JSON: {"imagePath": "https://imgbp.salonboard.com/..."}
 SALON_BOARD_IMAGE_UPLOAD_URL = "https://salonboard.com/KLP/blog/blogImageAjax/doUpload"
+# Confirm endpoint (POST blog form fields → returns confirmation page with new CSRF)
+SALON_BOARD_BLOG_CONFIRM_URL = "https://salonboard.com/KLP/blog/blog/confirm"
+# Final reflect endpoint (POST new CSRF + storeIdForMultipleTabCheck → 302 to /complete).
+# Discovered: the "登録・反映予約する" button (id="reflect") JS posts here with just
+# 2 fields: the new TOKEN from the confirm response + the unchanged storeIdForMultipleTabCheck.
+SALON_BOARD_BLOG_REFLECT_URL = "https://salonboard.com/KLP/blog/blog/doReflectComplete"
 
 
 # Staff IDs (verified from the blog edit form select options)
@@ -225,6 +232,15 @@ BLOG_CATEGORY_CODES = {
     "おすすめデザイン": "KL04",
     "ビューティー": "KL05",
 }
+
+# Staff IDs that should be excluded from the public-facing staff dropdown
+# (= 非掲載 staff). Salon Board's blog form requires this list to be POSTed
+# in the unPublishStaff hidden field — otherwise non-published staff may
+# accidentally re-appear as selectable authors.
+# Captured value: "W001414182," (single id + trailing comma).
+UNPUBLISH_STAFF_IDS: list[str] = [
+    "W001414182",  # pome (non-publishing)
+]
 
 
 # Salon Board は post-login ページに JavaScript 変数 sc_data を inline で埋め込んで、
@@ -465,3 +481,205 @@ def is_logged_in_after(
 
     log.info("✅ Probe confirms authenticated state: title=%r", title)
     return True
+
+
+# ----- blog submission (input → confirm → reflect) -----
+
+
+# Struts CSRF token: hidden <input> appearing on every form-bearing page.
+# The value changes on every render — the confirm response carries a *new* token
+# that doReflectComplete requires.
+_CSRF_RE = re.compile(
+    r'<input[^>]*name="org\.apache\.struts\.taglib\.html\.TOKEN"[^>]*value="([^"]+)"',
+    re.IGNORECASE,
+)
+# Per-tab nonce that Salon Board uses to detect "form opened in multiple tabs"
+# situations. Unchanged across the input → confirm → reflect chain.
+_STORE_TAB_RE = re.compile(
+    r'<input[^>]*name="storeIdForMultipleTabCheck"[^>]*value="([^"]+)"',
+    re.IGNORECASE,
+)
+
+
+def _parse_form_tokens(body: str) -> tuple[str, str]:
+    """Return (csrf_token, storeIdForMultipleTabCheck) from form HTML.
+
+    Raises RuntimeError if either field is missing.
+    """
+    csrf = _CSRF_RE.search(body)
+    tab = _STORE_TAB_RE.search(body)
+    if not csrf or not tab:
+        raise RuntimeError(
+            "Failed to parse form tokens "
+            f"(csrf_found={bool(csrf)}, tab_found={bool(tab)})"
+        )
+    return csrf.group(1), tab.group(1)
+
+
+def submit_blog(
+    relay: SalonBoardRelay,
+    *,
+    title: str,
+    body: str,
+    staff_id: str,
+    reserve_dt: datetime,
+    category_code: str = "KL03",
+    image_paths: list[Path | str] | None = None,
+    unpublish_staff_ids: list[str] | None = None,
+) -> str:
+    """ブログ記事を Salon Board に投稿する（予約投稿）.
+
+    フロー (DevTools キャプチャで判明):
+      1. GET  /KLP/blog/blog/                  → CSRF + storeIdForMultipleTabCheck
+      2. POST /KLP/blog/blogImageAjax/doUpload → 画像ごとに imagePath を取得
+      3. POST /KLP/blog/blog/confirm           → 確認画面 + 新 CSRF
+      4. POST /KLP/blog/blog/doReflectComplete → 302 → /KLP/blog/blog/complete
+
+    Args:
+        relay: 既にログイン済の SalonBoardRelay。
+        title: タイトル（必須）。
+        body: 本文の HTML（nicEdit 互換: <p>, <br>, <strong>, <img> 等が使える）。
+        staff_id: 投稿スタッフ ID。``STAFF_IDS`` の値から1つを渡す。
+        reserve_dt: 予約投稿日時。tz-naive でも tz-aware でも構わないが、
+            Salon Board は JST で扱うので JST のローカル時刻として送信する。
+            分以上の精度は送信されず分単位で 00 にされるわけではなく、
+            HHMM そのまま送る（実際の予約スロットは 00分/15分/30分/45分のみ）。
+        category_code: ``BLOG_CATEGORY_CODES`` の値。デフォルトは "おすすめメニュー" (KL03)。
+        image_paths: 最大4枚までの画像ファイルパス。None / 空なら画像なし投稿。
+        unpublish_staff_ids: 非掲載スタッフ ID リスト。None なら
+            モジュール定数 ``UNPUBLISH_STAFF_IDS`` を使う。
+
+    Returns:
+        完了画面の URL (``https://salonboard.com/KLP/blog/blog/complete``)。
+
+    Raises:
+        ValueError: image_paths が4枚を超える場合。
+        RuntimeError: いずれかのステップで HTTP / フォーム検証エラー。
+    """
+    images = list(image_paths or [])
+    if len(images) > 4:
+        raise ValueError(f"Salon Board blog accepts up to 4 images; got {len(images)}")
+
+    unpublish_list = (
+        list(unpublish_staff_ids)
+        if unpublish_staff_ids is not None
+        else list(UNPUBLISH_STAFF_IDS)
+    )
+    # 観測された送信値は "W001414182," のように末尾カンマ込み。空なら空文字。
+    unpublish_field = (",".join(unpublish_list) + ",") if unpublish_list else ""
+
+    # ----- Step 1: GET input form (CSRF + storeIdForMultipleTabCheck) -----
+    log.info("Submit blog [1/4]: GET %s", SALON_BOARD_BLOG_NEW_URL)
+    r = relay.get(
+        SALON_BOARD_BLOG_NEW_URL,
+        headers={"Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5"},
+    )
+    if r.status != 200:
+        raise RuntimeError(f"Blog form load failed: HTTP {r.status}")
+    csrf_in, tab_in = _parse_form_tokens(r.body_text)
+    log.info(
+        "  Initial form tokens: csrf=%s..., tab=%s...",
+        csrf_in[:8], tab_in[:8],
+    )
+
+    # ----- Step 2: Upload images sequentially -----
+    image_urls: list[str] = []
+    for idx, img in enumerate(images, start=1):
+        log.info("Submit blog [2/4]: upload image %d/%d", idx, len(images))
+        image_urls.append(upload_image(relay, img))
+
+    # ----- Step 3: POST confirm -----
+    rsv_date = reserve_dt.strftime("%Y%m%d")
+    rsv_time = reserve_dt.strftime("%H%M")
+
+    confirm_data: dict[str, str] = {
+        "org.apache.struts.taglib.html.TOKEN": csrf_in,
+        "storeIdForMultipleTabCheck": tab_in,
+        "blogContents1": body,
+        "blogContents2": "",
+        "blogContents3": "",
+        "blogContents4": "",
+        "blogContents5": "",
+        "imagePath1": image_urls[0] if len(image_urls) >= 1 else "",
+        "imagePath2": image_urls[1] if len(image_urls) >= 2 else "",
+        "imagePath3": image_urls[2] if len(image_urls) >= 3 else "",
+        "imagePath4": image_urls[3] if len(image_urls) >= 4 else "",
+        "staffId": staff_id,
+        "unPublishStaff": unpublish_field,
+        "blogCategoryCd": category_code,
+        "title": title,
+        "rsvTokoFlg": "1",
+        "rsvTokoDate": rsv_date,
+        "rsvTokoTime": rsv_time,
+    }
+
+    log.info(
+        "Submit blog [3/4]: POST %s (title=%r, staff=%s, cat=%s, rsv=%s %s, imgs=%d)",
+        SALON_BOARD_BLOG_CONFIRM_URL,
+        title[:30], staff_id, category_code, rsv_date, rsv_time, len(image_urls),
+    )
+    r = relay.post(
+        SALON_BOARD_BLOG_CONFIRM_URL,
+        data=confirm_data,
+        headers={
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            "Origin": "https://salonboard.com",
+            "Referer": SALON_BOARD_BLOG_NEW_URL,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        follow_redirects=False,
+    )
+    if r.status != 200:
+        preview = r.body_text[:400].replace("\n", " ")
+        raise RuntimeError(f"Confirm failed: HTTP {r.status}. Body: {preview}")
+
+    # 確認画面に「修正」「戻る」が出ていなければバリデーションエラー画面の可能性
+    if "id=\"reflect\"" not in r.body_text and "reflect" not in r.body_text.lower():
+        # エラーメッセージ抽出（class="error" や赤字 div 想定; 取れなければ本文先頭）
+        err_match = re.search(
+            r'<(?:span|div|p)[^>]*(?:class|id)="[^"]*err[^"]*"[^>]*>([^<]+)',
+            r.body_text, re.IGNORECASE,
+        )
+        msg = err_match.group(1).strip() if err_match else r.body_text[:300]
+        raise RuntimeError(f"Confirm rejected the form: {msg}")
+
+    csrf_new, tab_new = _parse_form_tokens(r.body_text)
+    log.info(
+        "  Confirm OK; new tokens: csrf=%s..., tab=%s...",
+        csrf_new[:8], tab_new[:8],
+    )
+    if tab_new != tab_in:
+        log.warning(
+            "storeIdForMultipleTabCheck changed across confirm (%s → %s); proceeding with new value",
+            tab_in[:8], tab_new[:8],
+        )
+
+    # ----- Step 4: POST doReflectComplete (final submit) -----
+    log.info("Submit blog [4/4]: POST %s", SALON_BOARD_BLOG_REFLECT_URL)
+    r = relay.post(
+        SALON_BOARD_BLOG_REFLECT_URL,
+        data={
+            "org.apache.struts.taglib.html.TOKEN": csrf_new,
+            "storeIdForMultipleTabCheck": tab_new,
+        },
+        headers={
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            "Origin": "https://salonboard.com",
+            "Referer": SALON_BOARD_BLOG_CONFIRM_URL,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        follow_redirects=False,
+    )
+
+    if r.status != 302:
+        preview = r.body_text[:400].replace("\n", " ")
+        raise RuntimeError(
+            f"doReflectComplete unexpected status: HTTP {r.status}. Body: {preview}"
+        )
+    if "complete" not in (r.location or "").lower():
+        raise RuntimeError(
+            f"doReflectComplete redirected to unexpected location: {r.location!r}"
+        )
+
+    log.info("✅ Blog submitted; redirect → %s", r.location)
+    return r.location
