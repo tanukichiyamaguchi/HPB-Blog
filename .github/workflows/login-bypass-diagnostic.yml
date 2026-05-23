@@ -468,6 +468,149 @@ jobs:
                   print(f"  ❌ {desc:45s} → {type(e).__name__}")
           PYEOF
 
+      - name: '[10] CRITICAL: ATS subdomain login with correct form fields'
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          # ats.salonboard.com is "SALON BOARD 採用管理 by AirWORK" — Recruit's
+          # recruitment management system, a DIFFERENT product from blog board.
+          # The URL parameter ?r=sb_login strongly suggests after-login redirect
+          # to Salon Board, implying Recruit SSO. If the same credentials work
+          # AND the SSO cookie is valid on salonboard.com, we have our bypass.
+          #
+          # Form structure (from ats_login.html):
+          #   - _csrf: dynamic CSRF token (hidden)
+          #   - username: text field (NOT userId)
+          #   - password: password field
+          #   - _keepId: hidden, value=on
+          #   - keepId: checkbox (optional)
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import os, re
+
+          uid = os.environ["SALON_BOARD_ID"]
+          pw = os.environ["SALON_BOARD_PASSWORD"]
+
+          session = requests.Session()
+          print("=== Step 1: GET ats login form to obtain CSRF token ===")
+          try:
+              r = session.get(
+                  "https://ats.salonboard.com/login?r=sb_login",
+                  impersonate="firefox133",
+                  headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                  timeout=15,
+              )
+              print(f"  HTTP {r.status_code}, body={len(r.text)}b, cookies={list(session.cookies.keys())}")
+          except Exception as e:
+              print(f"  ❌ GET failed: {e}")
+              import sys; sys.exit(0)
+
+          # Extract CSRF token
+          m = re.search(r'name="_csrf"\s+value="([^"]+)"', r.text)
+          if not m:
+              print("  ❌ Could not find _csrf token in form")
+              import sys; sys.exit(0)
+          csrf = m.group(1)
+          print(f"  CSRF token: {csrf[:30]}...")
+
+          print()
+          print("=== Step 2: POST credentials to /login with CSRF ===")
+          try:
+              r = session.post(
+                  "https://ats.salonboard.com/login",
+                  impersonate="firefox133",
+                  data={
+                      "_csrf": csrf,
+                      "username": uid,
+                      "password": pw,
+                      "_keepId": "on",
+                      # do NOT send "keepId" to test default behavior
+                  },
+                  headers={
+                      "Accept-Language": "ja-JP,ja;q=0.9",
+                      "Origin": "https://ats.salonboard.com",
+                      "Referer": "https://ats.salonboard.com/login?r=sb_login",
+                      "Content-Type": "application/x-www-form-urlencoded",
+                  },
+                  timeout=20,
+                  allow_redirects=False,
+              )
+              loc = r.headers.get("Location") or r.headers.get("location") or ""
+              setcookie = r.headers.get("Set-Cookie") or ""
+              print(f"  HTTP {r.status_code}, body={len(r.text)}b")
+              print(f"  Location: {loc!r}")
+              print(f"  Set-Cookie names: {list(session.cookies.keys())}")
+              # Save first 600 chars of body
+              if r.text:
+                  preview = r.text[:600].replace("\n", " ")
+                  print(f"  Body preview: {preview!r}")
+          except Exception as e:
+              print(f"  ❌ POST failed: {e}")
+              import sys; sys.exit(0)
+
+          # If we got a redirect, follow it manually a few times and inspect
+          print()
+          print("=== Step 3: Follow redirects manually (up to 5) ===")
+          current_url = loc
+          for hop in range(5):
+              if not current_url:
+                  print("  No redirect URL; stopping")
+                  break
+              if current_url.startswith("/"):
+                  # Same-host redirect
+                  base = "https://ats.salonboard.com" if hop == 0 else current_url.split("//")[0] + "//" + current_url.split("/")[2]
+                  current_url = "https://ats.salonboard.com" + current_url if not current_url.startswith("http") else current_url
+              print(f"  Hop {hop+1}: GET {current_url}")
+              try:
+                  r = session.get(
+                      current_url, impersonate="firefox133",
+                      headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                      timeout=15, allow_redirects=False,
+                  )
+                  loc = r.headers.get("Location") or r.headers.get("location") or ""
+                  print(f"    → HTTP {r.status_code}, Location={loc!r}")
+                  if not loc and r.status_code == 200:
+                      # We landed somewhere. Check if it's logged-in shaped
+                      is_login_form = "ログイン" in r.text and "password" in r.text
+                      print(f"    Landed at: {current_url}")
+                      print(f"    Is login page? {is_login_form}")
+                      print(f"    Cookies now: {list(session.cookies.keys())}")
+                      break
+                  current_url = loc
+              except Exception as e:
+                  print(f"    ❌ {e}")
+                  break
+
+          print()
+          print("=== Step 4: Test if session cookies work on salonboard.com ===")
+          try:
+              r = session.get(
+                  "https://salonboard.com/KLP/",
+                  impersonate="firefox133",
+                  headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                  timeout=15,
+                  allow_redirects=False,
+              )
+              loc = r.headers.get("Location") or r.headers.get("location") or ""
+              print(f"  GET /KLP/: HTTP {r.status_code}, Location={loc!r}, body={len(r.text)}b")
+              if r.status_code == 200 and "ログイン" not in r.text[:2000]:
+                  print(f"  🎉 LOOKS LOGGED IN!")
+              if r.text:
+                  title_m = re.search(r"<title>([^<]*)</title>", r.text)
+                  if title_m:
+                      print(f"  Title: {title_m.group(1)}")
+          except Exception as e:
+              print(f"  ❌ {e}")
+
+          # Save all cookies for inspection
+          all_cookies = dict(session.cookies)
+          print(f"\n=== Final cookies ({len(all_cookies)}) ===")
+          for name in sorted(all_cookies):
+              val = all_cookies[name]
+              print(f"  {name}: {val[:60]}{'...' if len(val) > 60 else ''}")
+          PYEOF
+
       - name: Upload discovery artifacts
         if: always()
         uses: actions/upload-artifact@v4
