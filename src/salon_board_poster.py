@@ -106,29 +106,17 @@ LOGIN_PW_SELECTORS: tuple[str, ...] = (
     "input[type='password']:visible",
 )
 LOGIN_SUBMIT_SELECTORS: tuple[str, ...] = (
-    # Salon Board submit is an <a> element with primaryBtn class (verified
-    # via D3 diagnostic: input[type='submit'] / button[type='submit'] were
-    # both NOT visible on the page).
-    # Scope everything to `form` first so we never accidentally match a
-    # header / navigation / help link.
+    # Verified via HTML dump (2026-01): the login button is:
+    #   <div class="loginBtnWrap">
+    #     <a href="javascript:void(0);"
+    #        class="common-CNCcommon__primaryBtn loginBtnSize"
+    #        onclick="dologin(event); return false;">ログイン</a>
+    #   </div>
+    "div.loginBtnWrap a.common-CNCcommon__primaryBtn",
+    "a.common-CNCcommon__primaryBtn.loginBtnSize",
+    "a[onclick*='dologin']",
     "form a.common-CNCcommon__primaryBtn",
-    "form a.common-CNCcommon__primaryBtn:has-text('ログイン')",
-    "form a[onclick*='login' i]",
-    "form a[onclick*='submit' i]",
-    "form a:text-is('ログイン')",
-    # Form-scoped, excluding help / forgot-password links.
-    "form a:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない')):not(:has-text('忘れ'))",
-    # Fall back to unscoped (only if no <form> element exists)
-    "a.common-CNCcommon__primaryBtn",
     "a.common-CNCcommon__primaryBtn:has-text('ログイン')",
-    "a[onclick*='login' i]",
-    "a[onclick*='submit' i]",
-    # Last resort: standard form submits (D3 said these are not visible
-    # for Salon Board, but kept for robustness in case the UI changes).
-    "form input[type='submit']",
-    "form button[type='submit']",
-    "input[type='submit']",
-    "button[type='submit']",
 )
 
 POSTER_SELECT_SELECTORS: tuple[str, ...] = (
@@ -449,6 +437,56 @@ class SalonBoardPoster:
         except Exception as e:  # noqa: BLE001
             log.debug("Safe eval failed for %r: %s", expression, e)
             return None
+
+    def _log_akamai_cookies(self, page: Page, label: str) -> None:
+        """Log presence and length of Akamai Bot Manager cookies.
+
+        Akamai's _abck cookie value encodes a bot-score state. Its presence and
+        a healthy structure (~~~0 suffix means "not yet validated") is required
+        for POST endpoints to accept the request. Logging this helps diagnose
+        whether a POST drop is "missing _abck" vs "fingerprint rejected".
+        """
+        try:
+            cookies = page.context.cookies()
+        except Exception as e:  # noqa: BLE001
+            log.debug("cookies() failed: %s", e)
+            return
+        names_of_interest = {"_abck", "ak_bmsc", "bm_sz", "bm_sv", "bm_mi"}
+        summary = []
+        for c in cookies:
+            if c.get("name") in names_of_interest:
+                val = c.get("value", "")
+                suffix = val[-4:] if val else ""
+                summary.append(f"{c['name']}(len={len(val)}, tail={suffix!r})")
+        log.info("Akamai cookies @ %s: %s",
+                 label, ", ".join(summary) if summary else "(none)")
+
+    def _wait_for_login_complete(self, page: Page, timeout_s: int = 45) -> bool:
+        """Wait until the page navigates away from the login URL.
+
+        Polls every 500ms, also detecting Firefox's neterror state as a fail.
+        Returns True if URL no longer contains '/login', False otherwise.
+        """
+        import time as _t
+        deadline = _t.monotonic() + timeout_s
+        login_marker = "/login"
+        last_logged = ""
+        while _t.monotonic() < deadline:
+            current = page.url
+            if login_marker not in current:
+                return True
+            body_cls = self._safe_eval(page, "document.body && document.body.className || ''") or ""
+            if "neterror" in body_cls:
+                log.warning("Firefox neterror detected during login wait")
+                return False
+            if current != last_logged:
+                log.info("Login wait: still at %s", current)
+                last_logged = current
+            try:
+                page.wait_for_timeout(500)
+            except Exception:  # noqa: BLE001
+                break
+        return False
 
     def _dump_form_html(self, page: Page, label: str) -> None:
         """Save the relevant form's outerHTML so selector mismatches can be diagnosed.
@@ -805,39 +843,104 @@ class SalonBoardPoster:
             wait_for_selectors=LOGIN_ID_SELECTORS,
         )
         self._screenshot(page, "01_login_page")
-
-        # Always dump the initial form HTML so selector mismatches can be
-        # diagnosed in a single iteration without needing artifact downloads.
-        # outerHTML does NOT include current input.value runtime state, so
-        # this is safe to keep in 14-day artifact retention.
+        # Initial form HTML for diagnosability (no input values in outerHTML).
         self._dump_form_html(page, "01_login_initial")
+
+        # Give Akamai's bot-manager JS a moment to set its _abck / ak_bmsc
+        # cookies. Submitting before these are populated triggers a silent
+        # POST drop. 2 seconds is enough on a 1.5s page load.
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:  # noqa: BLE001
+            pass
+        page.wait_for_timeout(1500)
+        self._log_akamai_cookies(page, "before_fill")
 
         if not self._try_fill(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
             raise RuntimeError("Could not locate login ID input")
         if not self._try_fill(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
             raise RuntimeError("Could not locate password input")
-        # NOTE: deliberately skipping a "02_login_filled" screenshot because it
-        # would render the salon's loginID in plaintext in Artifacts (retained 14d).
-        # Password fields are masked by the browser, but the ID field is not.
+        # NOTE: no "02_login_filled" screenshot — would leak loginID in artifacts.
 
-        # Detect if the page navigated to Firefox's internal neterror page
-        # (e.g. Akamai silently dropped a background request triggered by fill).
-        # Catching this early lets us fail with a precise message instead of
-        # spending 35s on doomed click attempts.
+        # Detect early if a background request put the page in Firefox's neterror.
         body_class = self._safe_eval(page, "document.body && document.body.className || ''")
         if body_class and "neterror" in body_class:
             raise RuntimeError(
                 f"Page became Firefox neterror after fill (body.class={body_class!r}); "
-                "likely Akamai blocked a background request from the login page."
+                "Akamai likely blocked a background request from the login page."
+            )
+        self._log_akamai_cookies(page, "after_fill")
+
+        # ----- Submit (three strategies, each with no_wait_after so we don't
+        #       hang waiting for navigation that Akamai might silently drop). -----
+        submitted_via: str | None = None
+
+        # Strategy 1: click the verified login button selector.
+        for sel in LOGIN_SUBMIT_SELECTORS:
+            try:
+                page.locator(sel).first.click(
+                    timeout=5000,
+                    # CRITICAL: don't wait for navigation after click. Akamai
+                    # may silently drop the POST; without this flag, click()
+                    # hangs for `timeout` ms even though the click landed.
+                    no_wait_after=True,
+                )
+                submitted_via = f"click({sel})"
+                log.info("login_submit: clicked %s", sel)
+                break
+            except Exception as e:  # noqa: BLE001
+                log.debug("login_submit click %s failed: %s", sel, e)
+
+        # Strategy 2: press Enter on the password field. The page has
+        # onkeypress="enterActionLogin(event)" on both inputs, so Enter
+        # triggers the same submit path as the button.
+        if submitted_via is None:
+            try:
+                page.locator("input[name='password']").first.press(
+                    "Enter", timeout=3000, no_wait_after=True,
+                )
+                submitted_via = "keypress(Enter on password)"
+                log.info("login_submit: triggered via Enter keypress")
+            except Exception as e:  # noqa: BLE001
+                log.debug("login_submit Enter-keypress failed: %s", e)
+
+        # Strategy 3: call dologin() directly via JS.
+        if submitted_via is None:
+            result = self._safe_eval(page, """() => {
+                if (typeof dologin !== 'function') return {ok: false, reason: 'dologin undefined'};
+                try { dologin(new Event('click')); return {ok: true}; }
+                catch (e) { return {ok: false, reason: String(e)}; }
+            }""")
+            if result and result.get("ok"):
+                submitted_via = "js(dologin)"
+                log.info("login_submit: triggered via JS dologin()")
+            else:
+                log.warning("login_submit JS dologin failed: %s", result)
+
+        if submitted_via is None:
+            self._dump_form_html(page, "02_no_submit_method_worked")
+            raise RuntimeError(
+                "All login submit strategies failed (click / Enter keypress / JS dologin)"
             )
 
-        if not self._try_click(page, LOGIN_SUBMIT_SELECTORS, "login_submit"):
-            # Capture the post-fail state too (may have neterror or partial nav)
-            self._dump_form_html(page, "02_login_after_click_failures")
-            if self._try_js_submit_login(page):
-                log.info("login_submit: succeeded via JS form.submit() fallback")
-            else:
-                raise RuntimeError("Could not locate login submit button")
+        # ----- Wait for login completion or hard-fail -----
+        if not self._wait_for_login_complete(page, timeout_s=45):
+            self._dump_form_html(page, "03_login_did_not_complete")
+            self._log_akamai_cookies(page, "after_failed_submit")
+            body_cls = self._safe_eval(page, "document.body && document.body.className || ''") or ""
+            url = page.url
+            if "neterror" in body_cls:
+                raise RuntimeError(
+                    f"Login POST was silently dropped by Akamai "
+                    f"(Firefox neterror after submit via {submitted_via}; url={url}). "
+                    "TLS fingerprint passes for GET but POST is blocked. "
+                    "Next step: switch login to curl_cffi HTTP-only flow."
+                )
+            raise RuntimeError(
+                f"Login did not complete within 45s (submitted via {submitted_via}, "
+                f"still at url={url}, body.class={body_cls!r})"
+            )
+        log.info("Login complete via %s; url=%s", submitted_via, page.url)
         self._wait_idle(page)
         self._screenshot(page, "03_after_login")
 
