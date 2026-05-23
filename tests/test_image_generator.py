@@ -25,6 +25,168 @@ def test_build_image_prompt_handles_unknown_menu():
     assert "日本人女性" in prompt
 
 
+def test_build_image_prompt_specifies_late_20s_persona():
+    """User requirement: 20代後半女性のペルソナ。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "20代後半" in prompt
+
+
+def test_build_image_prompt_specifies_frontal_view():
+    """User requirement: 正面からの画像。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "正面" in prompt
+    # Forbidden angle words appear only inside negative-instruction sentences
+    assert "横顔・斜めアングル・俯瞰・あおりは禁止" in prompt
+
+
+def test_build_image_prompt_excludes_nose_hair_etc():
+    """User requirement: 鼻や髪は写さず、目元のみにトリミング。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    # The negative-instruction sentence must list every excluded body part
+    for forbidden_part in ("鼻", "口", "頬", "耳", "髪", "額", "首"):
+        assert forbidden_part in prompt, f"missing exclusion for {forbidden_part}"
+    assert "フレーム内に入れない" in prompt
+
+
+def test_build_image_prompt_universal_lash_style():
+    """User requirement: 全画像で長め＋束感のまつげ。"""
+    # Even for brow-focused menus, the universal lash style applies
+    for menu in ("眉毛WAX", "眉毛スタイリング", "まつげパーマ", "ラッシュリフト"):
+        prompt = build_image_prompt("テーマ", menu)
+        assert "長め" in prompt, f"missing 長め for menu={menu}"
+        assert "束感" in prompt, f"missing 束感 for menu={menu}"
+        assert "クラスター" in prompt, f"missing クラスター for menu={menu}"
+
+
+def test_build_image_prompt_universal_brow_style():
+    """User requirement: 全画像で毛流れ整い・剃り跡なしの眉。"""
+    for menu in ("眉毛WAX", "眉毛スタイリング", "まつげパーマ", "ラッシュリフト"):
+        prompt = build_image_prompt("テーマ", menu)
+        assert "毛流れ" in prompt, f"missing 毛流れ for menu={menu}"
+        assert "剃" in prompt, f"missing 剃 (must mention no-razor-look) for menu={menu}"
+        assert "自然な肌" in prompt, f"missing 自然な肌 for menu={menu}"
+
+
+def test_build_image_prompt_lash_perm_extra_emphasis():
+    """まつげパーマ の場合は基本に加えてさらに強調される。"""
+    prompt = build_image_prompt("初夏のまつげケア", "まつげパーマ")
+    # Has the universal base AND extra emphasis for lash perm
+    assert "束感" in prompt
+    assert "さらに強調" in prompt
+
+
+def test_build_image_prompt_lash_lift_maintains_base_cluster():
+    """Lash lift now keeps base cluster (no longer reduces it)."""
+    prompt = build_image_prompt("ラッシュリフト紹介", "ラッシュリフト")
+    assert "リフト" in prompt
+    # Should NOT downgrade the cluster — universal style still applies
+    assert "束感は控えめ" not in prompt
+    assert "基本通り維持" in prompt
+
+
+def test_build_image_prompt_uses_professional_model_lighting():
+    """User requirement (latest): モデル撮影用ライトでライトアップ。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "モデル撮影" in prompt
+    assert "プロライティング" in prompt
+    assert "美容雑誌" in prompt
+    # Old amateur/iPhone language must be gone
+    assert "iPhone" not in prompt
+    assert "素人" not in prompt
+    assert "スマートフォン" not in prompt
+    assert "Instagram" not in prompt
+
+
+def test_build_image_prompt_keeps_natural_skin_texture():
+    """Professional but not over-retouched — natural skin nuance preserved."""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    # Should still avoid heavy face-tune
+    assert "美肌アプリ" in prompt or "美肌フィルター" in prompt
+    assert "リアル" in prompt
+
+
+def test_build_image_prompt_extreme_close_up_crop():
+    """User requirement: もっと目元のみのアップに。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "片目を中心" in prompt
+    assert "超クローズアップ" in prompt
+    assert "超拡大率" in prompt
+
+
+def test_build_image_prompt_two_panel_collage():
+    """User requirement: 添付画像のように二分割になるように。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "2分割" in prompt
+    assert "上パネル" in prompt
+    assert "下パネル" in prompt
+    assert "縦長" in prompt
+    # Must NOT be a before/after comparison
+    assert "before" not in prompt.lower()
+    assert "after" not in prompt.lower()
+    assert "ビフォー" not in prompt
+    assert "アフター" not in prompt
+
+
+def test_build_image_prompt_no_visible_brow_pores():
+    """User requirement: 眉周りの黒い毛穴は無いように。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "黒い毛穴" in prompt
+    assert "陶器のように" in prompt or "陶器" in prompt
+    # The instruction must be a negation (no pores), not just "pores"
+    assert "毛穴・黒い点" in prompt or "黒い毛穴・黒い点" in prompt
+
+
+def test_build_image_prompt_neat_organized_lash_bundles():
+    """User requirement: まつ毛をきれいな毛流れの束感に整える（バラバラはNG）。"""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "整然と" in prompt
+    assert "規則的な束" in prompt
+    # Must reject the previous "random" cluster wording
+    assert "ランダムに" not in prompt
+    # Must explicitly forbid scattered hairs
+    assert "バラバラに散らばった毛は一切なし" in prompt
+
+
+def test_build_image_prompt_varies_by_seed():
+    """Different seeds should yield different prompts (diversity)."""
+    import random
+
+    p1 = build_image_prompt("テーマ", "眉毛WAX", rng=random.Random(1))
+    p2 = build_image_prompt("テーマ", "眉毛WAX", rng=random.Random(2))
+    assert p1 != p2, "Same prompt across different seeds — diversity broken"
+
+
+def test_build_image_prompt_eye_diversity_across_seeds():
+    """Across many seeds, multiple distinct eye types should appear."""
+    import random
+
+    seen = set()
+    for seed in range(50):
+        prompt = build_image_prompt("テーマ", "眉毛WAX", rng=random.Random(seed))
+        for line in prompt.splitlines():
+            if line.startswith("目元タイプ"):
+                seen.add(line.strip())
+                break
+    assert len(seen) >= 5, f"Only {len(seen)} unique eye types in 50 trials"
+
+
+def test_build_image_prompt_includes_eye_and_skin_type_labels():
+    """Each prompt should label the sampled eye and skin attributes."""
+    prompt = build_image_prompt("テーマ", "眉毛WAX")
+    assert "目元タイプ：" in prompt
+    assert "肌タイプ：" in prompt
+    assert "眉の毛量ベース：" in prompt
+
+
+def test_build_image_prompt_same_seed_reproducible():
+    """Same seed → same prompt (test determinism)."""
+    import random
+
+    p1 = build_image_prompt("テーマA", "眉毛WAX", rng=random.Random(42))
+    p2 = build_image_prompt("テーマA", "眉毛WAX", rng=random.Random(42))
+    assert p1 == p2
+
+
 def test_build_image_prompt_rejects_forbidden_words():
     # Building a prompt with forbidden words shouldn't happen via the public API,
     # but the validation should catch it if someone modifies _MENU_VISUAL_HINTS.

@@ -149,3 +149,82 @@ def test_generate_theme_raises_on_empty_response(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="empty theme"):
         generate_theme(client=mock_client, now=datetime(2026, 6, 15), history_override=[])
+
+
+def test_generate_themes_batch_returns_n_unique_results(monkeypatch, tmp_path):
+    """Batch generation returns N results with within-batch uniqueness via in-flight history."""
+    from src.theme_generator import generate_themes_batch
+
+    p = tmp_path / "theme_prompt.md"
+    p.write_text("{{TODAY_DATE}} {{MENU_FOCUS}} {{RECENT_THEMES}}", encoding="utf-8")
+    monkeypatch.setattr("src.theme_generator.THEME_PROMPT_PATH", p)
+
+    # Mock client returns deterministic themes; we just verify the function
+    # calls .messages.create() exactly count times and accumulates results.
+    counter = {"i": 0}
+
+    def fake_create(**kwargs):
+        counter["i"] += 1
+        return SimpleNamespace(content=[SimpleNamespace(text=f"テーマ{counter['i']}")])
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = fake_create
+
+    results = generate_themes_batch(
+        count=7,
+        base_now=datetime(2026, 5, 23),
+        history_override=[],
+        client=mock_client,
+    )
+    assert len(results) == 7
+    # Each result is a ThemeResult with sequential dates
+    dates = [r.date for r in results]
+    assert dates == [f"2026-05-{23 + i}" for i in range(7)]
+    # Themes are distinct (because our mock returns distinct counter values)
+    assert len({r.theme for r in results}) == 7
+
+
+def test_generate_themes_batch_zero_count_returns_empty(monkeypatch, tmp_path):
+    from src.theme_generator import generate_themes_batch
+
+    p = tmp_path / "theme_prompt.md"
+    p.write_text("placeholder", encoding="utf-8")
+    monkeypatch.setattr("src.theme_generator.THEME_PROMPT_PATH", p)
+
+    assert generate_themes_batch(0, base_now=datetime(2026, 5, 23), client=MagicMock()) == []
+    assert generate_themes_batch(-1, base_now=datetime(2026, 5, 23), client=MagicMock()) == []
+
+
+def test_generate_themes_batch_dedupes_within_batch(monkeypatch, tmp_path):
+    """Subsequent iterations must see prior batch themes in the prompt (recent_themes)."""
+    from src.theme_generator import generate_themes_batch
+
+    p = tmp_path / "theme_prompt.md"
+    p.write_text("{{RECENT_THEMES}}", encoding="utf-8")
+    monkeypatch.setattr("src.theme_generator.THEME_PROMPT_PATH", p)
+
+    seen_recent_blocks: list[str] = []
+    counter = {"i": 0}
+
+    def fake_create(**kwargs):
+        counter["i"] += 1
+        # Capture the user prompt to verify in-flight history is propagated
+        seen_recent_blocks.append(kwargs["messages"][0]["content"])
+        return SimpleNamespace(content=[SimpleNamespace(text=f"unique{counter['i']}")])
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = fake_create
+
+    generate_themes_batch(
+        count=3,
+        base_now=datetime(2026, 5, 23),
+        history_override=[],
+        client=mock_client,
+    )
+    # First iteration has empty recent (just "（なし）")
+    assert "（なし）" in seen_recent_blocks[0]
+    # Second iteration sees first theme
+    assert "unique1" in seen_recent_blocks[1]
+    # Third iteration sees both prior themes
+    assert "unique1" in seen_recent_blocks[2]
+    assert "unique2" in seen_recent_blocks[2]

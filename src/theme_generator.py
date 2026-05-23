@@ -10,6 +10,9 @@ from typing import Any
 from anthropic import Anthropic
 
 from src.config import (
+    ANTHROPIC_TIMEOUT_SEC,
+    API_RETRY_ATTEMPTS,
+    API_RETRY_BASE_DELAY_SEC,
     CLAUDE_MAX_TOKENS_THEME,
     CLAUDE_MODEL,
     MENUS,
@@ -116,6 +119,37 @@ def append_to_history(result: ThemeResult) -> None:
     write_json(THEME_HISTORY_PATH, history)
 
 
+def generate_themes_batch(
+    count: int,
+    *,
+    base_now: datetime | None = None,
+    client: Anthropic | None = None,
+    history_override: list[dict[str, Any]] | None = None,
+) -> list[ThemeResult]:
+    """Generate ``count`` themes for consecutive days, ensuring within-batch dedup.
+
+    Each iteration uses a date offset (base_now + i days) so the menu rotation
+    and recent-themes filter see a stable view of "the current day for this post".
+    After each iteration we append the just-generated theme to the in-flight
+    history so the next iteration's prompt includes it in the "既出テーマ" block —
+    preventing the LLM from emitting near-duplicates within the same batch.
+    """
+    if count <= 0:
+        return []
+    base_now = base_now or get_jst_now()
+    in_flight_history = list(history_override if history_override is not None else _load_history())
+    results: list[ThemeResult] = []
+    for i in range(count):
+        target_now = base_now + timedelta(days=i)
+        log.info("Batch theme %d/%d for %s", i + 1, count, target_now.strftime("%Y-%m-%d"))
+        result = generate_theme(
+            client=client, now=target_now, history_override=in_flight_history,
+        )
+        results.append(result)
+        in_flight_history.append(result.to_dict())
+    return results
+
+
 def generate_theme(
     client: Anthropic | None = None,
     *,
@@ -134,7 +168,11 @@ def generate_theme(
         today.strftime("%Y-%m-%d"), menu_focus, season, len(recent),
     )
 
-    api_client = client or Anthropic(api_key=_require_api_key())
+    api_client = client or Anthropic(
+        api_key=_require_api_key(),
+        timeout=ANTHROPIC_TIMEOUT_SEC,
+        max_retries=0,  # we handle retries ourselves
+    )
 
     def _call() -> Any:
         return api_client.messages.create(
@@ -143,7 +181,12 @@ def generate_theme(
             messages=[{"role": "user", "content": user_prompt}],
         )
 
-    message = retry(_call, max_attempts=3, base_delay=2.0, logger=log)
+    message = retry(
+        _call,
+        max_attempts=API_RETRY_ATTEMPTS,
+        base_delay=API_RETRY_BASE_DELAY_SEC,
+        logger=log,
+    )
     raw = _extract_text(message)
     theme = _sanitize_theme(raw)
     if not theme:

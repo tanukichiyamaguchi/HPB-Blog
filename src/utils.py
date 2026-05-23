@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,10 +16,26 @@ T = TypeVar("T")
 
 _LOG_CONFIGURED = False
 
+_LOG_LEVEL_MAP = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
 
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
+
+def setup_logging(level: int | None = None) -> logging.Logger:
+    """Initialize root logging once.
+
+    Level resolution: explicit ``level`` arg > ``LOG_LEVEL`` env > INFO.
+    """
     global _LOG_CONFIGURED
     if not _LOG_CONFIGURED:
+        if level is None:
+            env_level = os.environ.get("LOG_LEVEL", "").strip().upper()
+            level = _LOG_LEVEL_MAP.get(env_level, logging.INFO)
         logging.basicConfig(
             level=level,
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -66,11 +84,61 @@ def read_json(path: Path) -> Any:
 
 
 def write_json(path: Path, data: Any) -> None:
+    """Atomically write JSON: write to tmp then rename.
+
+    Prevents a partially-written file from corrupting state if the process is
+    killed mid-write (e.g., theme_history.json during a CI run).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp_path_str = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path_str, str(path))  # atomic on POSIX and Windows
+    except Exception:
+        # Best-effort cleanup of the temp file on failure
+        try:
+            os.unlink(tmp_path_str)
+        except OSError:
+            pass
+        raise
+
+
+def retry(
+    fn: Callable[[], T],
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 2.0,
+    logger: logging.Logger | None = None,
+) -> T:
+    """Run fn() with exponential backoff. Returns the result on success."""
+    log = logger or logging.getLogger(__name__)
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - we re-raise after retries
+            last_exc = e
+            if attempt == max_attempts:
+                log.error("Final attempt %d/%d failed: %s", attempt, max_attempts, e)
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            log.warning(
+                "Attempt %d/%d failed: %s. Retrying in %.1fs",
+                attempt, max_attempts, e, delay,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
 
 
 def retry(

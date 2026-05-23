@@ -1,0 +1,80 @@
+name: Test Relay Login
+
+# お名前.com PHP リレー経由で salonboard.com にログインできるかを検証する。
+# 認証情報は GitHub Secrets から取得。relay は事前にデプロイ済みのこと。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install minimal deps
+        run: pip install --quiet 'requests>=2.32.0'
+
+      - name: '[1] Relay liveness: GET relay.php without secret (expect 403)'
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+        run: |
+          if [ -z "$RELAY_URL" ]; then
+            echo "❌ RELAY_URL secret is not set"; exit 1
+          fi
+          echo "Probing: $RELAY_URL"
+          status=$(curl -s -o /tmp/r1 -w "%{http_code}" "$RELAY_URL")
+          echo "HTTP $status"
+          echo "Body: $(cat /tmp/r1)"
+          if [ "$status" = "403" ] && grep -q "Forbidden" /tmp/r1; then
+            echo "✅ Relay is reachable and rejects unauthenticated requests"
+          else
+            echo "⚠️ Unexpected response (proceeding anyway)"
+          fi
+
+      - name: '[2] Login via relay'
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          python3 << 'PYEOF'
+          import logging, os, sys
+          logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+          sys.path.insert(0, "src")
+          from salon_board_relay import SalonBoardRelay, login, is_logged_in_after
+
+          relay = SalonBoardRelay(
+              os.environ["RELAY_URL"],
+              os.environ["RELAY_SECRET"],
+          )
+
+          try:
+              login_resp = login(
+                  relay,
+                  os.environ["SALON_BOARD_ID"],
+                  os.environ["SALON_BOARD_PASSWORD"],
+              )
+              print("\n=== LOGIN RESPONSE ===")
+              print(f"Status:    {login_resp.status}")
+              print(f"Location:  {login_resp.location}")
+              print(f"Cookies (in relay session): {sorted(relay.cookies.keys())}")
+              print(f"Session ID: {relay.session_id}")
+          except RuntimeError as e:
+              print(f"\n❌ Login failed: {e}")
+              sys.exit(1)
+
+          print("\n=== AUTH PROBE ===")
+          authed = is_logged_in_after(relay)
+          if authed:
+              print("🎉🎉🎉 AUTHENTICATED via relay! Salon Board fully accessible from GitHub Actions.")
+          else:
+              print("⚠️  Login succeeded but probe says not authenticated. Body may need re-inspection.")
+              sys.exit(2)
+          PYEOF

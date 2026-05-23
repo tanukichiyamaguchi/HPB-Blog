@@ -2,6 +2,11 @@ anthropic>=0.40.0
 google-genai>=0.3.0
 playwright>=1.48.0
 requests>=2.32.0
+# Firefox-impersonating HTTP client. Required because Akamai on salonboard.com
+# blocks the default Python requests TLS fingerprint; curl_cffi mimics
+# Firefox 133 / Safari 17 TLS exactly so the preflight probe succeeds from
+# GitHub Actions runners (US Azure IPs).
+curl_cffi>=0.7.0
 python-dotenv>=1.0.1
 pytest>=8.3.0
 pytest-asyncio>=0.24.0

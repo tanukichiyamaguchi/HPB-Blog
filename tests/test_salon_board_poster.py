@@ -1,11 +1,15 @@
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from src.salon_board_poster import (
+    DEFAULT_CATEGORY,
+    POSTER_ROTATION,
     PostResult,
     SalonBoardPoster,
     _safe_filename,
+    get_poster_for_date,
 )
 
 
@@ -106,3 +110,99 @@ def test_post_as_scheduled_rejects_missing_image(tmp_path: Path):
             "title", "body", tmp_path / "missing.png",
             datetime(2026, 6, 16, 8, 15),
         )
+
+
+def test_poster_rotation_constants():
+    """User spec: rotate momo / aoi / ケイト 蒲田西口店, exclude pome(非掲載)."""
+    assert POSTER_ROTATION == ("momo", "aoi", "ケイト 蒲田西口店")
+
+
+def test_default_category_is_recommended_menu():
+    """User said 'カテゴリは最適な内容を選択' — for menu-focused content, おすすめメニュー."""
+    assert DEFAULT_CATEGORY == "おすすめメニュー"
+
+
+def test_get_poster_for_date_returns_known_poster():
+    """Output must always come from POSTER_ROTATION."""
+    for d in (date(2026, 5, 23), date(2026, 5, 24), date(2026, 5, 25), date(2026, 12, 31)):
+        assert get_poster_for_date(d) in POSTER_ROTATION
+
+
+def test_get_poster_for_date_rotates_daily():
+    """Three consecutive days must yield three distinct posters (full cycle)."""
+    d1 = date(2026, 5, 23)
+    d2 = date(2026, 5, 24)
+    d3 = date(2026, 5, 25)
+    p1 = get_poster_for_date(d1)
+    p2 = get_poster_for_date(d2)
+    p3 = get_poster_for_date(d3)
+    assert {p1, p2, p3} == set(POSTER_ROTATION)
+
+
+def test_get_poster_for_date_repeats_every_three_days():
+    """Day N and Day N+3 must be the same poster."""
+    d = date(2026, 5, 23)
+    same = date(2026, 5, 26)
+    assert get_poster_for_date(d) == get_poster_for_date(same)
+
+
+def test_get_poster_for_date_is_deterministic():
+    """Calling twice with the same date returns the same poster."""
+    d = date(2026, 5, 23)
+    assert get_poster_for_date(d) == get_poster_for_date(d)
+
+
+def test_batch_post_item_default_category():
+    """Smoke: BatchPostItem dataclass has the right default fields."""
+    from datetime import datetime
+    from src.salon_board_poster import BatchPostItem
+
+    item = BatchPostItem(
+        title="t", body="b", image_path=Path("/tmp/x.png"),
+        scheduled_dt=datetime(2026, 5, 24, 8, 15),
+        poster="momo",
+    )
+    assert item.category == "おすすめメニュー"
+    assert item.label == ""
+
+
+def test_post_batch_scheduled_empty_input_short_circuits():
+    """Posting an empty batch should not even launch a browser."""
+    from src.salon_board_poster import SalonBoardPoster
+
+    p = SalonBoardPoster("uid", "pw")
+    # Should return [] without raising — verifies we early-exit before any browser launch
+    assert p.post_batch_scheduled([]) == []
+
+
+def test_post_batch_scheduled_rejects_invalid_items(tmp_path: Path):
+    """Validation must fire BEFORE we attempt browser launch."""
+    from datetime import datetime
+    from src.salon_board_poster import BatchPostItem, SalonBoardPoster
+
+    poster_obj = SalonBoardPoster("uid", "pw")
+    valid_image = tmp_path / "x.png"
+    valid_image.write_bytes(b"\x89PNG")
+    base_dt = datetime(2026, 5, 24, 8, 15)
+
+    # Empty title
+    with pytest.raises(ValueError):
+        poster_obj.post_batch_scheduled([BatchPostItem(
+            title="", body="b", image_path=valid_image, scheduled_dt=base_dt, poster="momo",
+        )])
+    # Empty body
+    with pytest.raises(ValueError):
+        poster_obj.post_batch_scheduled([BatchPostItem(
+            title="t", body="", image_path=valid_image, scheduled_dt=base_dt, poster="momo",
+        )])
+    # Missing image
+    with pytest.raises(FileNotFoundError):
+        poster_obj.post_batch_scheduled([BatchPostItem(
+            title="t", body="b", image_path=tmp_path / "missing.png",
+            scheduled_dt=base_dt, poster="momo",
+        )])
+    # Empty poster
+    with pytest.raises(ValueError):
+        poster_obj.post_batch_scheduled([BatchPostItem(
+            title="t", body="b", image_path=valid_image, scheduled_dt=base_dt, poster="",
+        )])

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,12 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from src.config import GEMINI_IMAGE_MODEL
+from src.config import (
+    API_RETRY_ATTEMPTS,
+    API_RETRY_BASE_DELAY_SEC,
+    GEMINI_IMAGE_MODEL,
+    GEMINI_TIMEOUT_SEC,
+)
 from src.utils import retry
 
 log = logging.getLogger(__name__)
@@ -23,28 +29,146 @@ class ImageResult:
     prompt: str
 
 
+# Universal beauty defaults — applied to every image regardless of menu_focus.
+# These represent the salon's standard finishing quality.
+_BASE_LASH_STYLE = (
+    "まつげは長めで密度があり、上向きに大きくカールし、毛が整然と並んだ美しい束感"
+    "（クラスター感・たばかん）を作る立体的な仕上がり。毛先がきちんと集まって"
+    "規則的な束を作り、毛流れが上向きに揃っていて、バラバラに散らばった毛は一切なし。"
+    "毛と毛の間隔も整って、美容雑誌のアイメイクページのような美しいビジュアル"
+)
+_BASE_BROW_STYLE = (
+    "眉は毛流れがきれいに整い、1本1本が同じ方向に揃ったナチュラルブロウ。"
+    "眉周りの肌は陶器のように滑らかで均一、黒い毛穴・黒い点・毛根の黒ずみ・"
+    "剃り跡・ワックス跡・肌の赤みや凹凸が一切見えない美しい肌質。"
+    "産毛は丁寧に処理されつつ、剃毛感や毛穴の暗い影が見えない、"
+    "なめらかで自然な肌の表情"
+)
+
+
 _MENU_VISUAL_HINTS: dict[str, str] = {
-    "眉毛WAX": "美しく整った眉のクローズアップ、ナチュラルなアーチ",
-    "眉毛スタイリング": "上品で整った眉のスタイル参考、ナチュラルメイク",
-    "まつげパーマ": "美しくカールしたまつげ、上向きの目元",
-    "ラッシュリフト": "ナチュラルに立ち上がったまつげ、目元クローズアップ",
+    "眉毛WAX": (
+        "今回のメニューは眉毛WAX。眉のラインと毛流れの美しさが特に際立つ仕上がり、"
+        "骨格に合った上品なアーチ"
+    ),
+    "眉毛スタイリング": (
+        "今回のメニューは眉毛スタイリング。骨格に沿ったライン取りと毛流れの整いが"
+        "特に映える仕上がり"
+    ),
+    "まつげパーマ": (
+        "今回のメニューはまつげパーマ。基本の束感をさらに強調し、上向きに大きく"
+        "カールしたまつげで目元がぱっちりと際立つ立体的な仕上がり"
+    ),
+    "ラッシュリフト": (
+        "今回のメニューはラッシュリフト。根元から自然に立ち上がった上向きの"
+        "リフトアップ効果で、目元が明るく開いた印象（束感は基本通り維持）"
+    ),
 }
+
+
+# Diversity pools — sampled per-call so each generation depicts a different woman.
+_EYE_VARIATIONS: tuple[str, ...] = (
+    "アーモンド型の落ち着いた目元",
+    "丸みのある大きな目元",
+    "切れ長で上品な目元",
+    "ぱっちりとした幅広二重の目元",
+    "末広二重の柔らかな目元",
+    "奥二重でクールな印象の目元",
+    "一重で凛とした印象の目元",
+    "たれ目気味で柔らかい印象の目元",
+    "つり目気味でシャープな印象の目元",
+    "やや離れ目の優しい印象の目元",
+)
+
+_SKIN_VARIATIONS: tuple[str, ...] = (
+    "色白でなめらかな肌",
+    "標準的な健康的な肌色",
+    "やや小麦色の自然な肌",
+    "陶器のような明るい肌",
+    "ほのかにそばかすのある自然な肌",
+    "頬にうっすら血色のある柔らかな肌",
+)
+
+_BROW_DENSITY_VARIATIONS: tuple[str, ...] = (
+    "やや細めで上品なナチュラル眉",
+    "標準的な太さの自然な眉",
+    "やや太めでしっかりとしたナチュラル眉",
+)
+
+
+# Professional model-shoot lighting style — replaces the prior iPhone-amateur look.
+# User wants the reference image aesthetic: bright even pro lighting + sharp closeup,
+# but still realistic (no excessive face-tune / over-smooth retouching).
+_PROFESSIONAL_PHOTO_STYLE = (
+    "モデル撮影用の均一なプロライティング（リングライトまたは大型ソフトボックス）で"
+    "目元と眉が明るくクリアに照らされた、美容雑誌のアイメイク特集ページのような"
+    "魅力的な仕上がり。瞳には小さな catch light（光の反射点）が映り込み、"
+    "肌は陶器のように滑らかに均一に照らされて影が柔らかい。"
+    "プロのマクロレンズ／接写レンズで撮影したような高精細な描写で、"
+    "まつげ1本1本と眉の毛流れまで鮮明に視認できるシャープさを保つ。"
+    "ただし美肌アプリのような不自然な平面的フィルターは避け、"
+    "肌のリアルな質感やニュアンスは残したナチュラルな美しさ"
+)
 
 
 _FORBIDDEN_WORDS = ("ビフォーアフター", "ビフォー", "アフター", "術前", "術後", "before", "after")
 
 
-def build_image_prompt(theme: str, menu_focus: str) -> str:
-    """Build a natural-language image prompt. Forbids before/after wording."""
-    menu_hint = _MENU_VISUAL_HINTS.get(menu_focus, "美しい目元のサロンスタイル参考")
+def build_image_prompt(
+    theme: str,
+    menu_focus: str,
+    *,
+    rng: random.Random | None = None,
+) -> str:
+    """Build a natural-language image prompt for Gemini image generation.
+
+    Composition requirements (all mandatory):
+      - Persona: Japanese woman in her late 20s
+      - Frontal view (両目が正面、首/肩のひねりなし)
+      - Tight crop on EYES + EYEBROWS only — no nose, mouth, hair, forehead, ears
+      - White / off-white solid background
+
+    Universal beauty defaults (every image, regardless of menu_focus):
+      - Lashes: long, dense, with natural bunched/clustered curl
+      - Brows: clean flow, no shaved/waxed look, smooth natural skin
+
+    Diversity: eye type / skin / brow density are sampled randomly per call so
+    consecutive generations depict different women.
+
+    Photo style: amateur iPhone aesthetic (no studio-grade polish).
+
+    Pass ``rng`` (a ``random.Random``) for deterministic sampling in tests.
+    """
+    r = rng if rng is not None else random
+    eye_type = r.choice(_EYE_VARIATIONS)
+    skin_type = r.choice(_SKIN_VARIATIONS)
+    brow_base = r.choice(_BROW_DENSITY_VARIATIONS)
+
+    menu_hint = _MENU_VISUAL_HINTS.get(menu_focus, "ナチュラルで美しい目元のサロンスタイル")
     prompt = (
-        "リアルな日本人女性の写真。"
-        f"{menu_hint}。"
-        f"テーマ：{theme}。"
-        "目元周辺のクローズアップ、自然光で明るく清潔感のある雰囲気。"
-        "背景は白系の単色で、シンプルでミニマル。"
-        "メイクは控えめでナチュラル。サロンスタイルの参考イメージとして、"
-        "高品質・高解像度・写真リアルな仕上がり。"
+        "ペルソナ：20代後半（27〜29歳）の日本人女性。\n"
+        f"目元タイプ：{eye_type}（毎回異なる個性の女性として描画する）。\n"
+        f"肌タイプ：{skin_type}。\n"
+        "【画像レイアウト・必須】1枚の画像内に、上下に2つの目元クローズアップが並ぶ"
+        "縦長の2分割コラージュ。上パネルと下パネルが横並びの帯状に積み重なった構成。\n"
+        "- 上パネル：目元の超クローズアップ（片目を中心、または両目とごく一部の眉）\n"
+        "- 下パネル：同じ女性の目元クローズアップ（やや異なる距離感・アングルで、別カット風）\n"
+        "- 両パネルとも同一の女性、同一の仕上がり（まつげの束感／眉／ライティングを統一）\n"
+        "- 両パネル間は細い白い区切り線または直接接した境界、画像全体の比率は縦長（3:4 または 4:5）\n"
+        "- ※施術の変化を見せる対比演出ではなく、雑誌の同一シーンを2カットで魅せる構成\n"
+        "構図（各パネル共通）：まつげ1本1本や眉の毛流れまでクリアに視認できる超拡大率。\n"
+        "厳格なトリミング指示：眉の少し上から目の下のごく一部までだけを写す。"
+        "鼻・口・頬・顎・耳・髪・額・首・肩は一切フレーム内に入れないこと。"
+        "横顔・斜めアングル・俯瞰・あおりは禁止、視線はカメラ正面。\n"
+        "【基本の仕上がり（全画像共通・厳守）】\n"
+        f"- まつげ：{_BASE_LASH_STYLE}。\n"
+        f"- 眉：{_BASE_BROW_STYLE}（眉の毛量ベース：{brow_base}）。\n"
+        f"【今回のメニュー強調】{menu_hint}。\n"
+        f"テーマ：{theme}。\n"
+        f"撮影スタイル：{_PROFESSIONAL_PHOTO_STYLE}。\n"
+        "背景：白〜オフホワイトの無地でシンプル、被写体（目元）を引き立てる清潔な背景。\n"
+        "メイク：控えめでナチュラル、肌は素肌感のある美しい質感（過度な美肌フィルターは"
+        "避けるが、サロンで仕上げた整った美しさは表現）。"
     )
     lowered = prompt.lower()
     for w in _FORBIDDEN_WORDS:
@@ -89,9 +213,13 @@ def generate_image(
     prompt = build_image_prompt(theme, menu_focus)
     log.info("Generating image (theme=%s, menu=%s)", theme, menu_focus)
 
-    api_client = client or genai.Client(api_key=_require_api_key())
+    api_client = client or genai.Client(
+        api_key=_require_api_key(),
+        http_options=types.HttpOptions(timeout=int(GEMINI_TIMEOUT_SEC * 1000)),
+    )
 
     def _call() -> Any:
+        log.info("Calling Gemini model=%s (timeout=%ss)", GEMINI_IMAGE_MODEL, GEMINI_TIMEOUT_SEC)
         return api_client.models.generate_content(
             model=GEMINI_IMAGE_MODEL,
             contents=prompt,
@@ -100,7 +228,12 @@ def generate_image(
             ),
         )
 
-    response = retry(_call, max_attempts=3, base_delay=2.0, logger=log)
+    response = retry(
+        _call,
+        max_attempts=API_RETRY_ATTEMPTS,
+        base_delay=API_RETRY_BASE_DELAY_SEC,
+        logger=log,
+    )
     image_bytes, mime_type = _extract_image(response)
 
     out_path = out_path_base.with_suffix(_resolve_extension(mime_type))

@@ -20,7 +20,7 @@ jobs:
   generate:
     name: Generate blog (theme + body + image)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,7 +43,14 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Optional model / timeout overrides (Repo Variables → Settings → Variables → Actions)
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          GEMINI_IMAGE_MODEL: ${{ vars.GEMINI_IMAGE_MODEL }}
+          ANTHROPIC_TIMEOUT_SEC: ${{ vars.ANTHROPIC_TIMEOUT_SEC }}
+          GEMINI_TIMEOUT_SEC: ${{ vars.GEMINI_TIMEOUT_SEC }}
+          API_RETRY_ATTEMPTS: ${{ vars.API_RETRY_ATTEMPTS }}
           LOG_LEVEL: ${{ inputs.log_level }}
+          PYTHONUNBUFFERED: "1"
         run: python -m src.main
 
       - name: Upload generation artifacts

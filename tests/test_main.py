@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -6,6 +7,7 @@ from src.config import JST
 from src.main import (
     SCHEDULED_PUBLISH_HOUR,
     SCHEDULED_PUBLISH_MINUTE,
+    _already_posted_today,
     _bool_env,
     compute_next_publish_dt,
 )
@@ -18,6 +20,76 @@ def test_compute_next_publish_dt_is_tomorrow_at_8_15_jst():
     assert next_dt.hour == SCHEDULED_PUBLISH_HOUR == 8
     assert next_dt.minute == SCHEDULED_PUBLISH_MINUTE == 15
     assert next_dt.tzinfo == JST
+
+
+def test_compute_next_publish_dt_clamps_past_to_next_day():
+    """If a delayed CI run happens AFTER tomorrow's 08:15, clamp forward."""
+    # Suppose run starts at next-day JST 09:00 (cron was delayed > 10h)
+    now = datetime(2026, 6, 16, 9, 0, 0, tzinfo=JST)
+    next_dt = compute_next_publish_dt(now)
+    # Naive impl would return 2026-06-17 08:15 (next day) — we should ALSO get that
+    assert next_dt > now
+    # And specifically, it should be on or after tomorrow
+    assert next_dt.date() >= datetime(2026, 6, 17).date()
+
+
+def test_compute_next_publish_dt_strictly_in_future():
+    """Property: returned datetime must be strictly after `now`."""
+    cases = [
+        datetime(2026, 6, 15, 7, 0, 0, tzinfo=JST),    # early morning before 8:15
+        datetime(2026, 6, 15, 8, 14, 0, tzinfo=JST),   # 1 min before 8:15
+        datetime(2026, 6, 15, 8, 15, 0, tzinfo=JST),   # exactly 8:15
+        datetime(2026, 6, 15, 8, 16, 0, tzinfo=JST),   # 1 min after 8:15
+        datetime(2026, 6, 15, 22, 15, 0, tzinfo=JST),  # normal cron time
+    ]
+    for now in cases:
+        next_dt = compute_next_publish_dt(now)
+        assert next_dt > now, f"compute_next_publish_dt({now}) returned {next_dt}, not > now"
+
+
+def test_already_posted_today_false_when_no_sentinel(tmp_path: Path):
+    assert _already_posted_today(tmp_path) is False
+
+
+def test_already_posted_today_true_when_sentinel_success(tmp_path: Path):
+    from src.utils import write_json
+    write_json(tmp_path / "salon_board_result.json", {"success": True, "final_url": "x"})
+    assert _already_posted_today(tmp_path) is True
+
+
+def test_already_posted_today_false_when_sentinel_failure(tmp_path: Path):
+    from src.utils import write_json
+    write_json(tmp_path / "salon_board_result.json", {"success": False, "error": "boom"})
+    assert _already_posted_today(tmp_path) is False
+
+
+def test_already_posted_today_false_when_sentinel_corrupt(tmp_path: Path):
+    (tmp_path / "salon_board_result.json").write_text("not-json", encoding="utf-8")
+    # Corrupt sentinel should be treated as "no successful post" rather than crashing
+    assert _already_posted_today(tmp_path) is False
+
+
+def test_publish_dt_for_offset_returns_correct_dates():
+    """Weekly batch: offset 0 → tomorrow 08:15, offset 6 → 7 days from now 08:15."""
+    from src.config import JST
+    from src.main import _publish_dt_for_offset
+
+    base = datetime(2026, 5, 23, 15, 0, 0, tzinfo=JST)
+    # offset 0 → 2026-05-24 08:15 JST
+    assert _publish_dt_for_offset(base, 0).date() == datetime(2026, 5, 24).date()
+    assert _publish_dt_for_offset(base, 0).hour == 8
+    assert _publish_dt_for_offset(base, 0).minute == 15
+    # offset 6 → 2026-05-30 08:15 JST
+    assert _publish_dt_for_offset(base, 6).date() == datetime(2026, 5, 30).date()
+
+
+def test_publish_dt_for_offset_handles_month_boundary():
+    from src.config import JST
+    from src.main import _publish_dt_for_offset
+
+    base = datetime(2026, 5, 30, 15, 0, 0, tzinfo=JST)
+    # offset 2 → 2026-06-02
+    assert _publish_dt_for_offset(base, 2).date() == datetime(2026, 6, 2).date()
 
 
 def test_compute_next_publish_dt_handles_month_boundary():
@@ -53,4 +125,14 @@ def test_bool_env(monkeypatch, val, expected):
 def test_bool_env_unset_default(monkeypatch):
     monkeypatch.delenv("FOO", raising=False)
     assert _bool_env("FOO") is False
-    assert _bool_env("FOO", default=True) is False  # empty maps to False explicitly
+    # Unset env now respects the supplied default (fixed semantics)
+    assert _bool_env("FOO", default=True) is True
+
+
+def test_bool_env_empty_string_respects_default(monkeypatch):
+    """Empty-string env var should behave the same as unset (use default)."""
+    monkeypatch.setenv("FOO", "")
+    assert _bool_env("FOO") is False
+    assert _bool_env("FOO", default=True) is True
+    monkeypatch.setenv("FOO", "   ")
+    assert _bool_env("FOO", default=True) is True

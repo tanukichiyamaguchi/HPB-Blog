@@ -1,0 +1,430 @@
+name: Extra Network Diagnostic
+
+# 通常の network-diagnostic で判明した「Akamai silent drop」を回避できる
+# 3つの未検証アプローチを並列に試す診断ワークフロー。
+#
+# - Job A: curl_cffi (Chrome TLS フィンガープリント模倣) from US IP
+# - Job B: VPN Gate (筑波大の無料VPN) JP node 経由
+# - Job C: Cloudflare WARP (Tokyo edge) 経由
+#
+# どれか1つでも salonboard.com に HTTP 200 を返せば、Oracle Cloud 不要で
+# GitHub Actions 上の無料運用が可能になる。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ============================================================
+  # Job A: curl_cffi (Chrome TLS impersonation) from US IP
+  # ============================================================
+  curl-cffi:
+    name: 'A. curl_cffi (Chrome TLS impersonation)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Runner location
+        run: |
+          IP=$(curl -s https://api.ipify.org)
+          echo "Public IP: $IP"
+          curl -s "https://ipinfo.io/$IP" | head -10 || true
+
+      - name: Install curl_cffi
+        run: python3 -m pip install --quiet 'curl_cffi>=0.7.0'
+
+      - name: '[A1] curl_cffi → salonboard.com (chrome131 fingerprint)'
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import time
+
+          targets = [
+              ("chrome131", "https://salonboard.com/login/"),
+              ("chrome120", "https://salonboard.com/login/"),
+              ("safari17_0", "https://salonboard.com/login/"),
+              ("firefox133", "https://salonboard.com/login/"),
+          ]
+          for fp, url in targets:
+              start = time.time()
+              try:
+                  r = requests.get(url, impersonate=fp, timeout=20, headers={
+                      "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+                  })
+                  elapsed = time.time() - start
+                  body_len = len(r.text)
+                  has_login = "ログイン" in r.text or "パスワード" in r.text
+                  print(f"  fp={fp:12s}  HTTP {r.status_code}  time={elapsed:.2f}s  body={body_len}b  login_form={has_login}")
+              except Exception as e:
+                  elapsed = time.time() - start
+                  print(f"  fp={fp:12s}  ❌ {type(e).__name__} after {elapsed:.2f}s")
+          PYEOF
+
+      - name: '[A2] Control: curl_cffi → hotpepper (should succeed)'
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          r = requests.get("https://beauty.hotpepper.jp/", impersonate="chrome131", timeout=15)
+          print(f"  HPB chrome131: HTTP {r.status_code}, body={len(r.text)}b")
+          PYEOF
+
+  # ============================================================
+  # Job B: VPN Gate (Tsukuba Univ. free VPN) JP node
+  # ============================================================
+  vpn-gate:
+    name: 'B. VPN Gate (free JP node)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OpenVPN
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openvpn curl
+
+      - name: Original (no VPN) IP & test
+        run: |
+          echo "=== Original IP (US Azure) ==="
+          curl -s https://api.ipify.org
+          echo ""
+          echo "Original test to salonboard.com:"
+          curl -I -s -o /dev/null -w "  HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 15 https://salonboard.com/login/ || echo "  failed"
+
+      - name: '[B1] Fetch VPN Gate server list, find JP node'
+        id: vpnconfig
+        run: |
+          # VPN Gate publishes server list as CSV
+          # Filter: country=JP, OpenVPN support=Yes, alive
+          echo "Fetching VPN Gate server list..."
+          curl -fsS --max-time 30 'https://www.vpngate.net/api/iphone/' -o /tmp/servers.csv
+          echo "Total lines: $(wc -l < /tmp/servers.csv)"
+
+          # CSV columns: HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,...,OpenVPN_ConfigData_Base64
+          # Find first JP server with OpenVPN config (column 15)
+          python3 << 'PYEOF' > /tmp/vpn_choice.txt
+          import csv, base64
+          with open("/tmp/servers.csv") as f:
+              # First 2 lines are header
+              for _ in range(2):
+                  next(f, None)
+              best = None
+              for row in csv.reader(f):
+                  if len(row) < 15: continue
+                  country = row[6].strip()
+                  if country != "JP": continue
+                  b64 = row[14].strip()
+                  if not b64: continue
+                  try:
+                      score = int(row[2])
+                  except ValueError:
+                      score = 0
+                  host = row[0]
+                  ip = row[1]
+                  if best is None or score > best[0]:
+                      best = (score, host, ip, b64)
+              if best:
+                  score, host, ip, b64 = best
+                  print(f"Selected: {host} @ {ip} (score={score})")
+                  with open("/tmp/jp.ovpn", "wb") as g:
+                      g.write(base64.b64decode(b64))
+                  print(f"Config written: /tmp/jp.ovpn ({len(b64)} b64 chars)")
+              else:
+                  print("NO JP SERVER FOUND")
+                  exit(1)
+          PYEOF
+          cat /tmp/vpn_choice.txt
+
+      - name: '[B2] Start OpenVPN to JP node'
+        run: |
+          # Run OpenVPN in background, redirect logs
+          sudo openvpn --config /tmp/jp.ovpn --daemon --log /tmp/ovpn.log \
+            --route-up "/bin/sh -c 'echo VPN_UP'" \
+            --script-security 2 \
+            --dev tun0 \
+            --persist-tun || true
+          # Wait up to 30 seconds for VPN connection to establish
+          for i in $(seq 1 30); do
+              if ip route show | grep -q "0.0.0.0/1 via"; then
+                  echo "VPN appears established after ${i}s"
+                  break
+              fi
+              sleep 1
+          done
+          echo "=== ip route after VPN ==="
+          ip route | head -10
+          echo "=== ovpn.log tail ==="
+          sudo tail -30 /tmp/ovpn.log || true
+
+      - name: '[B3] Verify exit IP is JP, then test salonboard.com'
+        run: |
+          echo "=== Public IP via VPN ==="
+          NEW_IP=$(curl -s --max-time 15 https://api.ipify.org || echo "FAILED")
+          echo "New IP: $NEW_IP"
+          curl -s --max-time 15 "https://ipinfo.io/$NEW_IP" | head -10 || true
+          echo ""
+          echo "=== salonboard.com via VPN-routed IP ==="
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+          curl -I -s -o /dev/null -w "  HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 30 -A "$UA" https://salonboard.com/login/ \
+            && echo "  ✅ salonboard reachable via VPN Gate JP" \
+            || echo "  ❌ Still blocked (or VPN unstable)"
+
+      - name: '[B4] Try Playwright via VPN-routed IP'
+        run: |
+          python3 -m pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium 2>&1 | tail -3
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+          import time
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=[
+                  "--no-sandbox", "--disable-blink-features=AutomationControlled",
+              ])
+              ctx = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo", user_agent=UA)
+              page = ctx.new_page()
+              start = time.time()
+              try:
+                  resp = page.goto("https://salonboard.com/login/", timeout=30000, wait_until="domcontentloaded")
+                  print(f"  ✅ Playwright via VPN: HTTP {resp.status}, {time.time()-start:.2f}s")
+                  print(f"  Title: {page.title()!r}")
+                  content = page.content()
+                  for kw in ["ログイン", "パスワード", "サロンボード"]:
+                      if kw in content:
+                          print(f"   - found keyword: {kw}")
+                  page.screenshot(path="/tmp/vpn_pw.png", full_page=True)
+              except Exception as e:
+                  print(f"  ❌ Playwright via VPN failed: {type(e).__name__}: {e}")
+                  try: page.screenshot(path="/tmp/vpn_pw_error.png", full_page=True)
+                  except Exception: pass
+              finally:
+                  browser.close()
+          PYEOF
+
+      - name: Upload VPN screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-gate-screenshots
+          path: |
+            /tmp/vpn_pw.png
+            /tmp/vpn_pw_error.png
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        if: always()
+        run: sudo pkill openvpn || true
+
+  # ============================================================
+  # Job C: Cloudflare WARP (Tokyo edge) routing
+  # ============================================================
+  cloudflare-warp:
+    name: 'C. Cloudflare WARP (Tokyo edge)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Original IP
+        run: |
+          curl -s https://api.ipify.org && echo
+          curl -s "https://ipinfo.io/$(curl -s https://api.ipify.org)" | head -10 || true
+
+      - name: Install Cloudflare WARP
+        run: |
+          curl https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+
+      - name: Configure and connect WARP
+        run: |
+          sudo warp-svc &
+          sleep 5
+          warp-cli --accept-tos registration new || true
+          warp-cli --accept-tos mode warp
+          warp-cli --accept-tos connect || true
+          sleep 8
+          warp-cli --accept-tos status || true
+
+      - name: Verify exit IP via WARP
+        run: |
+          NEW_IP=$(curl -s --max-time 15 https://api.ipify.org || echo "FAILED")
+          echo "WARP IP: $NEW_IP"
+          curl -s --max-time 15 "https://ipinfo.io/$NEW_IP" | head -10 || true
+
+      - name: '[C1] salonboard.com via WARP'
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+          curl -I -s -o /dev/null -w "  HTTP %{http_code}, time=%{time_total}s\n" \
+            --max-time 30 -A "$UA" https://salonboard.com/login/ \
+            && echo "  ✅ reachable via WARP" \
+            || echo "  ❌ blocked via WARP"
+
+      - name: Cleanup
+        if: always()
+        run: warp-cli --accept-tos disconnect || true
+
+  # ============================================================
+  # Job D: Playwright Firefox / WebKit from US IP
+  # ============================================================
+  # Job A で curl_cffi の safari17_0 と firefox133 が salonboard に
+  # HTTP 200 で通ったことが判明。Akamai は Chrome の TLS フィンガープリントを
+  # 狙い撃ちで遮断している。Playwright を Firefox / WebKit に切り替えれば
+  # 米国IPからの GitHub Actions ランナーで運用可能になる可能性が高い。
+  playwright-firefox-webkit:
+    name: 'D. Playwright Firefox / WebKit (US IP)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Runner location
+        run: |
+          IP=$(curl -s https://api.ipify.org)
+          echo "Public IP: $IP"
+          curl -s "https://ipinfo.io/$IP" | head -8 || true
+
+      - name: Install Playwright with Firefox & WebKit
+        run: |
+          python3 -m pip install --quiet playwright
+          python3 -m playwright install --with-deps firefox webkit 2>&1 | tail -5
+
+      - name: '[D1] Playwright Firefox → salonboard.com'
+        run: |
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+          import time, traceback
+
+          with sync_playwright() as p:
+              browser = p.firefox.launch(
+                  headless=True,
+                  firefox_user_prefs={
+                      "intl.accept_languages": "ja-JP,ja",
+                      "general.useragent.locale": "ja-JP",
+                  },
+              )
+              ctx = browser.new_context(
+                  locale="ja-JP",
+                  timezone_id="Asia/Tokyo",
+                  viewport={"width": 1280, "height": 800},
+                  extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+              )
+              page = ctx.new_page()
+              start = time.time()
+              try:
+                  resp = page.goto(
+                      "https://salonboard.com/login/",
+                      timeout=30000,
+                      wait_until="domcontentloaded",
+                  )
+                  elapsed = time.time() - start
+                  print(f"  ✅ Firefox: HTTP {resp.status}, {elapsed:.2f}s")
+                  print(f"  Final URL : {page.url}")
+                  print(f"  Title     : {page.title()!r}")
+                  content = page.content()
+                  print(f"  Body len  : {len(content)} chars")
+                  hits = [kw for kw in ["ログイン", "パスワード", "サロンボード"] if kw in content]
+                  print(f"  Keywords  : {hits}")
+                  if resp.status < 400 and hits:
+                      print("  🎉 FIREFOX PASSES Akamai check on US IP.")
+                  page.screenshot(path="/tmp/firefox_sb.png", full_page=True)
+              except Exception as e:
+                  elapsed = time.time() - start
+                  print(f"  ❌ Firefox failed after {elapsed:.2f}s: {type(e).__name__}: {e}")
+                  try: page.screenshot(path="/tmp/firefox_sb_error.png", full_page=True)
+                  except Exception: pass
+              finally:
+                  browser.close()
+          PYEOF
+
+      - name: '[D2] Playwright WebKit → salonboard.com'
+        run: |
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+          import time
+
+          with sync_playwright() as p:
+              browser = p.webkit.launch(headless=True)
+              ctx = browser.new_context(
+                  locale="ja-JP",
+                  timezone_id="Asia/Tokyo",
+                  viewport={"width": 1280, "height": 800},
+                  extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+              )
+              page = ctx.new_page()
+              start = time.time()
+              try:
+                  resp = page.goto(
+                      "https://salonboard.com/login/",
+                      timeout=30000,
+                      wait_until="domcontentloaded",
+                  )
+                  elapsed = time.time() - start
+                  print(f"  ✅ WebKit: HTTP {resp.status}, {elapsed:.2f}s")
+                  print(f"  Final URL : {page.url}")
+                  print(f"  Title     : {page.title()!r}")
+                  content = page.content()
+                  print(f"  Body len  : {len(content)} chars")
+                  hits = [kw for kw in ["ログイン", "パスワード", "サロンボード"] if kw in content]
+                  print(f"  Keywords  : {hits}")
+                  if resp.status < 400 and hits:
+                      print("  🎉 WEBKIT PASSES Akamai check on US IP.")
+                  page.screenshot(path="/tmp/webkit_sb.png", full_page=True)
+              except Exception as e:
+                  elapsed = time.time() - start
+                  print(f"  ❌ WebKit failed after {elapsed:.2f}s: {type(e).__name__}: {e}")
+                  try: page.screenshot(path="/tmp/webkit_sb_error.png", full_page=True)
+                  except Exception: pass
+              finally:
+                  browser.close()
+          PYEOF
+
+      - name: '[D3] Confirm form interaction in Firefox (input found?)'
+        run: |
+          # If [D1] passed, try to actually interact with form elements
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+
+          with sync_playwright() as p:
+              browser = p.firefox.launch(headless=True)
+              ctx = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
+              page = ctx.new_page()
+              try:
+                  page.goto("https://salonboard.com/login/", timeout=30000, wait_until="domcontentloaded")
+                  # Look for the actual login form input fields
+                  id_field = page.locator("#idPasswordInputId, input[name='userId'], input[name='loginId']").first
+                  pw_field = page.locator("#idPasswordInputPassword, input[name='password']").first
+                  submit_btn = page.locator("button[type='submit'], input[type='submit']").first
+                  print(f"  ID input visible    : {id_field.is_visible(timeout=5000)}")
+                  print(f"  PW input visible    : {pw_field.is_visible(timeout=5000)}")
+                  print(f"  Submit btn visible  : {submit_btn.is_visible(timeout=5000)}")
+                  print("  🎉 Login form is interactable from Firefox on US IP.")
+              except Exception as e:
+                  print(f"  ⚠️  Form interaction check: {type(e).__name__}: {e}")
+              finally:
+                  browser.close()
+          PYEOF
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-webkit-diagnostic
+          path: |
+            /tmp/firefox_sb.png
+            /tmp/firefox_sb_error.png
+            /tmp/webkit_sb.png
+            /tmp/webkit_sb_error.png
+          if-no-files-found: ignore
+
+  # ============================================================
+  # Summary
+  # ============================================================
+  summary:
+    name: 'Summary'
+    runs-on: ubuntu-latest
+    needs: [curl-cffi, vpn-gate, cloudflare-warp, playwright-firefox-webkit]
+    if: always()
+    steps:
+      - name: Decision matrix
+        run: |
+          echo "================================="
+          echo "📊 Decision matrix"
+          echo "================================="
+          echo "Confirmed earlier:"
+          echo "  - curl_cffi safari17_0 / firefox133 → HTTP 200 (Akamai targets Chrome TLS only)"
+          echo ""
+          echo "If [D1] Firefox passes  → 🎉 Migrate Playwright to firefox.launch()"
+          echo "If [D2] WebKit passes   → 🎉 Migrate Playwright to webkit.launch()"
+          echo "If both fail            → Use curl_cffi-based HTTP-only flow (more complex)"

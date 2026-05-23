@@ -1,8 +1,39 @@
 # HPB ブログ自動投稿システム
 
-ホットペッパービューティー（HPB）のサロンボード管理画面に対して、毎日自動でブログを投稿するシステム。GitHub Actions 上で完全クラウド完結で動作します。
+ホットペッパービューティー（HPB）のサロンボード管理画面に対して、毎日自動でブログを投稿するシステム。
 
 対象サロン: **KATEstageLASH（ケイトステージラッシュ）** 蒲田駅西口店
+
+---
+
+## 運用モード
+
+### 🔵 推奨: GitHub Actions で完全クラウド運用（**永久無料・追加環境不要**）
+
+salonboard.com の Akamai Bot Manager は **Chromium 系の TLS フィンガープリント
+のみ** を選択的に遮断していることが診断で判明（Firefox/WebKit は通過）。
+Playwright を **Firefox エンジン** で動かすことで、米国 GitHub Actions ランナー
+（US Azure IP）からそのままアクセス可能。
+
+| 項目 | 状況 |
+|------|------|
+| 月額費用 | **¥0**（GitHub Actions 無料枠内）|
+| VPS / PC 設定 | **不要** |
+| 設定変更 | Repo Variables `ENABLE_DAILY_CRON=true` をセットするだけ |
+
+cron は `.github/workflows/daily-blog.yml` が **JST 22:15** に自動起動 →
+翌朝 8:15 公開予約として 1 日 1 件を Salon Board に登録。
+
+### 🟡 代替: Windows PC で週次バッチ
+
+サロン PC で **週1回 `run_weekly.bat` をダブルクリック**、**7日分の予約投稿**
+を一括で登録する方式。セットアップ手順は **[docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)**。
+
+### 🟡 代替: 日本VPS / Oracle Cloud Tokyo Free（GitHub Actions が将来塞がれた場合）
+
+将来 Akamai が Firefox TLS も遮断したり、運用上の理由で日本IP出口が必要に
+なった場合のバックアップ。詳細は **[docs/VPS_SETUP.md](docs/VPS_SETUP.md)** /
+**[docs/ORACLE_CLOUD_SETUP.md](docs/ORACLE_CLOUD_SETUP.md)**。
 
 ---
 
@@ -101,7 +132,7 @@ python -m src.main
 
 ### 本番運用
 
-`.github/workflows/daily-blog.yml` の cron が JST 22:00 に自動起動します。
+`.github/workflows/daily-blog.yml` の cron が **JST 22:15**（UTC 13:15）に自動起動します。
 ジョブの進行は Actions タブで確認、Slack 通知でも結果が届きます。
 
 ### 手動テスト
@@ -111,7 +142,51 @@ python -m src.main
 ### スケジュール変更
 
 `daily-blog.yml` の cron 値を編集してください（UTC 表記）。
-例：JST 22:00 = UTC 13:00 → `cron: '0 13 * * *'`
+例：JST 22:15 = UTC 13:15 → `cron: '15 13 * * *'`
+
+## ネットワーク診断
+
+GitHub Actions IPからサロンボードへの到達性を確認するための診断ワークフロー。
+
+実行方法：
+1. GitHub リポジトリの **Actions** タブを開く
+2. 左メニューから **Network Diagnostic** を選択
+3. **Run workflow** ボタンをクリック
+4. 実行完了後、ログを確認
+
+## トラブルシューティング
+
+### Salon Board に接続できない（タイムアウトする）
+
+**原因**: salonboard.com の Akamai Bot Manager は **Chromium 系の TLS
+フィンガープリント** を選択的に遮断します。Playwright の `chromium.launch()`
+や Python の `requests` / `curl` はこれに該当し、TLS ハンドシェイクは通るが
+HTTP レスポンスが返らず 30 秒で timeout します。
+
+**対応**: 本リポジトリでは `firefox.launch()` を使用しており、診断で
+Firefox / WebKit / curl_cffi の Safari17・Firefox133 フィンガープリントが
+HTTP 200 で通ることを確認済（2026年1月時点）。コードを Chromium ベースに
+書き戻すと再発します。
+
+将来 Firefox も遮断された場合のバックアップ:
+- 日本 IP の VPS / Oracle Cloud → **[docs/VPS_SETUP.md](docs/VPS_SETUP.md)**
+- 日本 IP の self-hosted runner → `daily-blog.yml` の `runs-on:` を
+  `self-hosted` に変更
+
+診断ワークフロー：`.github/workflows/network-diagnostic.yml` /
+`extra-diagnostics.yml` で `salonboard.com` への到達性を任意に検証可能。
+
+### モデルが見つからない（404 / model_not_found）
+
+`CLAUDE_MODEL` / `GEMINI_IMAGE_MODEL` を Repo Variables で
+別の既知モデル名に上書き可能：
+
+- 例: `GEMINI_IMAGE_MODEL=gemini-2.5-flash-image-preview`
+
+### `LOG_LEVEL=DEBUG` でログを詳細化
+
+Repo Variables もしくは workflow_dispatch input で `LOG_LEVEL=DEBUG` を
+指定すると、セレクタ試行・各 retry の詳細などが出力されます。
 
 ## 制約事項
 
