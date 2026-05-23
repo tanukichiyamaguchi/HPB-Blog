@@ -167,6 +167,26 @@ jobs:
           echo "ℹ️  read-only verification only (confirm_post=${{ inputs.confirm_post }})"
           echo "    To run the full E2E test, dispatch again with confirm_post=yes."
 
+      - name: 'Show debug dumps in log (on failure)'
+        if: failure() && inputs.confirm_post == 'yes'
+        run: |
+          set +e
+          DIR="${{ github.workspace }}/debug-dumps"
+          if [ ! -d "$DIR" ]; then
+            echo "No debug-dumps directory (nothing dumped)."
+            exit 0
+          fi
+          for f in "$DIR"/*.html "$DIR"/*.txt; do
+            [ -e "$f" ] || continue
+            echo ""
+            echo "================================================================"
+            echo "=== $f ($(wc -c < "$f") bytes)"
+            echo "================================================================"
+            cat "$f"
+            echo ""
+            echo "=== EOF $f ==="
+          done
+
       - name: 'Upload debug dump (on failure)'
         if: failure() && inputs.confirm_post == 'yes'
         uses: actions/upload-artifact@v4
