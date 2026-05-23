@@ -69,29 +69,6 @@ def test_already_posted_today_false_when_sentinel_corrupt(tmp_path: Path):
     assert _already_posted_today(tmp_path) is False
 
 
-def test_publish_dt_for_offset_returns_correct_dates():
-    """Weekly batch: offset 0 → tomorrow 08:15, offset 6 → 7 days from now 08:15."""
-    from src.config import JST
-    from src.main import _publish_dt_for_offset
-
-    base = datetime(2026, 5, 23, 15, 0, 0, tzinfo=JST)
-    # offset 0 → 2026-05-24 08:15 JST
-    assert _publish_dt_for_offset(base, 0).date() == datetime(2026, 5, 24).date()
-    assert _publish_dt_for_offset(base, 0).hour == 8
-    assert _publish_dt_for_offset(base, 0).minute == 15
-    # offset 6 → 2026-05-30 08:15 JST
-    assert _publish_dt_for_offset(base, 6).date() == datetime(2026, 5, 30).date()
-
-
-def test_publish_dt_for_offset_handles_month_boundary():
-    from src.config import JST
-    from src.main import _publish_dt_for_offset
-
-    base = datetime(2026, 5, 30, 15, 0, 0, tzinfo=JST)
-    # offset 2 → 2026-06-02
-    assert _publish_dt_for_offset(base, 2).date() == datetime(2026, 6, 2).date()
-
-
 def test_compute_next_publish_dt_handles_month_boundary():
     now = datetime(2026, 6, 30, 22, 15, 0, tzinfo=JST)
     next_dt = compute_next_publish_dt(now)

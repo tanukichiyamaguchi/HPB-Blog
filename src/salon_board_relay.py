@@ -15,7 +15,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -214,6 +214,31 @@ SALON_BOARD_BLOG_CONFIRM_URL = "https://salonboard.com/KLP/blog/blog/confirm"
 # Discovered: the "登録・反映予約する" button (id="reflect") JS posts here with just
 # 2 fields: the new TOKEN from the confirm response + the unchanged storeIdForMultipleTabCheck.
 SALON_BOARD_BLOG_REFLECT_URL = "https://salonboard.com/KLP/blog/blog/doReflectComplete"
+# KLP top page. Visiting this after login establishes the KLP-area session state
+# that some KLP/blog endpoints expect (Salon Board / Struts session is partly
+# constructed by visiting top-level area pages, not just by login).
+SALON_BOARD_KLP_TOP_URL = "https://salonboard.com/KLP/top/"
+# Blog list page. Browser users naturally pass through it before reaching the
+# new-post form; visiting it lets Salon Board populate any per-feature session
+# state needed for confirm/doReflectComplete.
+SALON_BOARD_BLOG_LIST_URL = "https://salonboard.com/KLP/blog/"
+
+
+# Realistic browser request headers, used for HTML navigation POSTs/GETs
+# to make our relay requests look like Firefox 133 (which we already advertise
+# in User-Agent via the PHP relay).
+_BROWSER_HTML_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+}
 
 
 # Staff IDs (verified from the blog edit form select options)
@@ -245,10 +270,12 @@ UNPUBLISH_STAFF_IDS: list[str] = [
 
 # Salon Board は post-login ページに JavaScript 変数 sc_data を inline で埋め込んで、
 # その中に userid と storeid を含める。認証成功なら storeid に実店舗 ID が入る。
-#   未認証: sc_data = { ..., userid : '', storeid : '', ... }
-#   認証済: sc_data = { ..., userid : 'CE12345', storeid : 'H000797013', ... }
-_STOREID_RE = re.compile(r"""storeid\s*:\s*['"]([^'"]*)['"]""")
-_USERID_RE = re.compile(r"""userid\s*:\s*['"]([^'"]*)['"]""")
+# 出力されるフォーマットは画面によって変わるので両方サポートする:
+#   ログイン直後ページ: sc_data = { ..., userid : '', storeid : 'H000797013', ... }
+#   ブログ編集ページ等: sc_data = {..."storeid":"H000797013","userid":"CE12345"...}
+# つまり storeid の後ろに `'` or `"` が来る場合もあれば、来ない場合もある。
+_STOREID_RE = re.compile(r"""['"]?storeid['"]?\s*:\s*['"]([^'"]*)['"]""")
+_USERID_RE = re.compile(r"""['"]?userid['"]?\s*:\s*['"]([^'"]*)['"]""")
 
 
 def _parse_login_state(body: str) -> tuple[str, str]:
@@ -486,19 +513,30 @@ def is_logged_in_after(
 # ----- blog submission (input → confirm → reflect) -----
 
 
-# Struts CSRF token: hidden <input> appearing on every form-bearing page.
-# The value changes on every render — the confirm response carries a *new* token
-# that doReflectComplete requires.
-_CSRF_RE = re.compile(
-    r'<input[^>]*name="org\.apache\.struts\.taglib\.html\.TOKEN"[^>]*value="([^"]+)"',
-    re.IGNORECASE,
-)
-# Per-tab nonce that Salon Board uses to detect "form opened in multiple tabs"
-# situations. Unchanged across the input → confirm → reflect chain.
-_STORE_TAB_RE = re.compile(
-    r'<input[^>]*name="storeIdForMultipleTabCheck"[^>]*value="([^"]+)"',
-    re.IGNORECASE,
-)
+# Struts CSRF token + per-tab nonce.
+# These tokens live on every form-bearing page. The CSRF value rotates on every
+# render — the confirm response carries a *new* CSRF that doReflectComplete
+# requires. The storeIdForMultipleTabCheck stays constant across input → confirm
+# → reflect (it's a per-tab session marker, not anti-CSRF).
+#
+# Real-world Salon Board HTML can emit attributes in either order
+# (name-then-value OR value-then-name) and may use single OR double quotes,
+# so we try several extraction patterns.
+def _hidden_field(body: str, field_name: str) -> str | None:
+    """Extract a hidden <input> value by field name, tolerant to attr ordering."""
+    fn = re.escape(field_name)
+    patterns = (
+        # name="x" ... value="..."
+        rf'<input[^>]*name=(["\']){fn}\1[^>]*value=(["\'])([^"\']*)\2',
+        # value="..." ... name="x"
+        rf'<input[^>]*value=(["\'])([^"\']*)\1[^>]*name=(["\']){fn}\3',
+    )
+    for i, pat in enumerate(patterns):
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            # group index depends on which pattern matched
+            return m.group(3) if i == 0 else m.group(2)
+    return None
 
 
 def _parse_form_tokens(body: str) -> tuple[str, str]:
@@ -506,14 +544,54 @@ def _parse_form_tokens(body: str) -> tuple[str, str]:
 
     Raises RuntimeError if either field is missing.
     """
-    csrf = _CSRF_RE.search(body)
-    tab = _STORE_TAB_RE.search(body)
+    csrf = _hidden_field(body, "org.apache.struts.taglib.html.TOKEN")
+    tab = _hidden_field(body, "storeIdForMultipleTabCheck")
     if not csrf or not tab:
         raise RuntimeError(
             "Failed to parse form tokens "
             f"(csrf_found={bool(csrf)}, tab_found={bool(tab)})"
         )
-    return csrf.group(1), tab.group(1)
+    return csrf, tab
+
+
+# Extract <option value="..."> values from a named <select> in the form HTML.
+# Used to validate rsvTokoDate / rsvTokoTime against Salon Board's allowed window
+# *before* POSTing — otherwise the server returns a generic KPCL030V02 error
+# page that doesn't tell us which field was wrong.
+_OPTION_VALUE_RE = re.compile(r'<option\s+value="([^"]*)"', re.IGNORECASE)
+
+
+def _select_options(body: str, select_name: str) -> list[str]:
+    """Return the option values inside <select name="select_name">...</select>.
+
+    Empty string options are filtered out (they're placeholder "" entries).
+    """
+    sel = re.search(
+        rf'<select[^>]*name="{re.escape(select_name)}"[^>]*>(.+?)</select>',
+        body, re.IGNORECASE | re.DOTALL,
+    )
+    if not sel:
+        return []
+    return [v for v in _OPTION_VALUE_RE.findall(sel.group(1)) if v]
+
+
+def _dump_debug_body(label: str, body: str) -> str | None:
+    """If SALON_BOARD_DEBUG_DUMP_DIR is set, write body to <dir>/<label>.html.
+
+    Returns the path written, or None.
+    """
+    dump_dir = os.environ.get("SALON_BOARD_DEBUG_DUMP_DIR", "").strip()
+    if not dump_dir:
+        return None
+    try:
+        Path(dump_dir).mkdir(parents=True, exist_ok=True)
+        path = Path(dump_dir) / f"{label}.html"
+        path.write_text(body, encoding="utf-8", errors="replace")
+        log.info("Dumped %s response body → %s (%d chars)", label, path, len(body))
+        return str(path)
+    except OSError as e:
+        log.warning("Failed to dump %s body: %s", label, e)
+        return None
 
 
 def submit_blog(
@@ -542,8 +620,10 @@ def submit_blog(
         staff_id: 投稿スタッフ ID。``STAFF_IDS`` の値から1つを渡す。
         reserve_dt: 予約投稿日時。tz-naive でも tz-aware でも構わないが、
             Salon Board は JST で扱うので JST のローカル時刻として送信する。
-            分以上の精度は送信されず分単位で 00 にされるわけではなく、
-            HHMM そのまま送る（実際の予約スロットは 00分/15分/30分/45分のみ）。
+            ※ Salon Board の予約 window 制約:
+              - 日付: 今日から約14日先まで
+              - 時刻: 00:00–03:00 と 08:15–23:45 の 15分刻みのみ（03:15–08:00 不可）
+            window 外の値を渡すと事前 validation で RuntimeError を投げる。
         category_code: ``BLOG_CATEGORY_CODES`` の値。デフォルトは "おすすめメニュー" (KL03)。
         image_paths: 最大4枚までの画像ファイルパス。None / 空なら画像なし投稿。
         unpublish_staff_ids: 非掲載スタッフ ID リスト。None なら
@@ -568,19 +648,59 @@ def submit_blog(
     # 観測された送信値は "W001414182," のように末尾カンマ込み。空なら空文字。
     unpublish_field = (",".join(unpublish_list) + ",") if unpublish_list else ""
 
+    # ----- Step 0: warm up KLP-area session by walking the natural path -----
+    # Browser users go login → /KLP/top/ → /KLP/blog/ → /KLP/blog/blog/ (new post).
+    # Skipping the intermediate pages causes Salon Board's confirm endpoint to
+    # reject the POST with the generic "KPCL030V02 / 操作しなおしてください" error
+    # (Struts session not fully initialized for the KLP/blog area).
+    for warmup_url in (SALON_BOARD_KLP_TOP_URL, SALON_BOARD_BLOG_LIST_URL):
+        log.info("Submit blog [0/4]: warm-up GET %s", warmup_url)
+        wr = relay.get(warmup_url, headers=_BROWSER_HTML_HEADERS)
+        log.info(
+            "  → HTTP %d (%d bytes); cookies now: %s",
+            wr.status, len(wr.body_bytes), sorted(relay.cookies.keys()),
+        )
+
     # ----- Step 1: GET input form (CSRF + storeIdForMultipleTabCheck) -----
     log.info("Submit blog [1/4]: GET %s", SALON_BOARD_BLOG_NEW_URL)
     r = relay.get(
         SALON_BOARD_BLOG_NEW_URL,
-        headers={"Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5"},
+        headers={
+            **_BROWSER_HTML_HEADERS,
+            "Referer": SALON_BOARD_BLOG_LIST_URL,
+        },
     )
     if r.status != 200:
         raise RuntimeError(f"Blog form load failed: HTTP {r.status}")
+    _dump_debug_body("form_get", r.body_text)
     csrf_in, tab_in = _parse_form_tokens(r.body_text)
     log.info(
-        "  Initial form tokens: csrf=%s..., tab=%s...",
-        csrf_in[:8], tab_in[:8],
+        "  Initial form tokens: csrf=%s..., tab=%s...; cookies: %s",
+        csrf_in[:8], tab_in[:8], sorted(relay.cookies.keys()),
     )
+
+    # Validate reserve_dt against Salon Board's actual allowed values.
+    # The reservation window is roughly today + 13 days, and times exclude
+    # the 03:15–08:00 maintenance window. Sending an out-of-range value gets
+    # silently rejected as a generic "KPCL030V02 / 操作しなおしてください" error
+    # with no field-level message, so we validate up front.
+    rsv_date_pre = reserve_dt.strftime("%Y%m%d")
+    rsv_time_pre = reserve_dt.strftime("%H%M")
+    allowed_dates = _select_options(r.body_text, "rsvTokoDate")
+    allowed_times = _select_options(r.body_text, "rsvTokoTime")
+    if allowed_dates and rsv_date_pre not in allowed_dates:
+        raise RuntimeError(
+            f"reserve_dt date {rsv_date_pre} is outside Salon Board's "
+            f"reservation window. Allowed: {allowed_dates[0]}..{allowed_dates[-1]} "
+            f"({len(allowed_dates)} days)."
+        )
+    if allowed_times and rsv_time_pre not in allowed_times:
+        raise RuntimeError(
+            f"reserve_dt time {rsv_time_pre} is not selectable. "
+            f"Salon Board blocks 03:15–08:00 (maintenance window). "
+            f"Allowed times: {len(allowed_times)} slots, "
+            f"e.g. {', '.join(allowed_times[:5])}..."
+        )
 
     # ----- Step 2: Upload images sequentially -----
     image_urls: list[str] = []
@@ -622,28 +742,48 @@ def submit_blog(
         SALON_BOARD_BLOG_CONFIRM_URL,
         data=confirm_data,
         headers={
-            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            **_BROWSER_HTML_HEADERS,
             "Origin": "https://salonboard.com",
             "Referer": SALON_BOARD_BLOG_NEW_URL,
             "Content-Type": "application/x-www-form-urlencoded",
         },
         follow_redirects=False,
     )
+    log.info(
+        "  → HTTP %d, %d bytes, %.2fs; cookies now: %s",
+        r.status, len(r.body_bytes), r.elapsed_seconds, sorted(relay.cookies.keys()),
+    )
     if r.status != 200:
+        _dump_debug_body("confirm_failed", r.body_text)
         preview = r.body_text[:400].replace("\n", " ")
         raise RuntimeError(f"Confirm failed: HTTP {r.status}. Body: {preview}")
 
-    # 確認画面に「修正」「戻る」が出ていなければバリデーションエラー画面の可能性
-    if "id=\"reflect\"" not in r.body_text and "reflect" not in r.body_text.lower():
+    # 確認画面の判定。reflect ボタン (id="reflect") の有無で見る。
+    # 「修正」「戻る」が出ない場合はバリデーションエラー画面 or 二重送信検出画面の可能性
+    if 'id="reflect"' not in r.body_text and "id='reflect'" not in r.body_text:
+        _dump_debug_body("confirm_no_reflect", r.body_text)
         # エラーメッセージ抽出（class="error" や赤字 div 想定; 取れなければ本文先頭）
         err_match = re.search(
-            r'<(?:span|div|p)[^>]*(?:class|id)="[^"]*err[^"]*"[^>]*>([^<]+)',
+            r'<(?:span|div|p)[^>]*(?:class|id)="[^"]*(?:err|error|alert)[^"]*"[^>]*>\s*([^<]+)',
             r.body_text, re.IGNORECASE,
         )
-        msg = err_match.group(1).strip() if err_match else r.body_text[:300]
+        msg = err_match.group(1).strip() if err_match else r.body_text[:400]
         raise RuntimeError(f"Confirm rejected the form: {msg}")
 
-    csrf_new, tab_new = _parse_form_tokens(r.body_text)
+    try:
+        csrf_new, tab_new = _parse_form_tokens(r.body_text)
+    except RuntimeError:
+        _dump_debug_body("confirm_unparseable", r.body_text)
+        # body 内に TOKEN という文字列があれば見つかった位置周辺をエラーに含めて返す
+        idx = r.body_text.find("TOKEN")
+        context = (
+            r.body_text[max(0, idx - 80) : idx + 200].replace("\n", " ")
+            if idx >= 0 else "(TOKEN string not found in body)"
+        )
+        raise RuntimeError(
+            "Confirm response has id=\"reflect\" but token parser failed. "
+            f"TOKEN context: ...{context}..."
+        )
     log.info(
         "  Confirm OK; new tokens: csrf=%s..., tab=%s...",
         csrf_new[:8], tab_new[:8],
@@ -663,7 +803,7 @@ def submit_blog(
             "storeIdForMultipleTabCheck": tab_new,
         },
         headers={
-            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            **_BROWSER_HTML_HEADERS,
             "Origin": "https://salonboard.com",
             "Referer": SALON_BOARD_BLOG_CONFIRM_URL,
             "Content-Type": "application/x-www-form-urlencoded",
@@ -683,3 +823,148 @@ def submit_blog(
 
     log.info("✅ Blog submitted; redirect → %s", r.location)
     return r.location
+
+
+# ----- high-level posting API (used by main.py / cron pipeline) -----
+
+
+# Daily author rotation (one per day). pome(非掲載) is intentionally excluded —
+# Salon Board treats them as non-publishing and they appear in the unPublishStaff
+# hidden field, not in the author select.
+POSTER_ROTATION: tuple[str, ...] = (
+    "momo",
+    "aoi",
+    "ケイト 蒲田西口店",
+)
+
+# Default category for our automation. The blog is always menu-focused so we
+# tag every post as "おすすめメニュー" unless the caller overrides it.
+DEFAULT_CATEGORY_LABEL = "おすすめメニュー"
+
+
+def get_poster_for_date(d: date) -> str:
+    """Return the rotating poster name for the given date (deterministic)."""
+    return POSTER_ROTATION[d.toordinal() % len(POSTER_ROTATION)]
+
+
+@dataclass
+class PostResult:
+    """Outcome of a high-level post operation, serialisable for the sentinel file."""
+    success: bool
+    final_url: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "final_url": self.final_url,
+            "error": self.error,
+        }
+
+
+def _format_body_html(text: str) -> str:
+    """Convert plain-text blog body into the HTML that Salon Board's blogContents1 expects.
+
+    nicEdit (the in-page WYSIWYG) emits ``<p>...</p>`` per paragraph with
+    ``<br />`` for soft line breaks. We mirror that so posts render the same
+    whether typed in the UI or submitted via this relay.
+    """
+    if not text or not text.strip():
+        return ""
+    normalised = text.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", normalised) if p.strip()]
+    return "\n".join(
+        f"<p>{p.replace(chr(10), '<br />')}</p>" for p in paragraphs
+    )
+
+
+def _require_credentials() -> tuple[str, str]:
+    """Return (user_id, password) from env vars, or raise."""
+    user_id = os.environ.get("SALON_BOARD_ID", "").strip()
+    password = os.environ.get("SALON_BOARD_PASSWORD", "").strip()
+    if not user_id or not password:
+        raise RuntimeError(
+            "SALON_BOARD_ID and SALON_BOARD_PASSWORD must both be set."
+        )
+    return user_id, password
+
+
+def post_blog_scheduled(
+    title: str,
+    body: str,
+    image_path: Path | str | None,
+    publish_at: datetime,
+    *,
+    poster: str,
+    category: str = DEFAULT_CATEGORY_LABEL,
+) -> PostResult:
+    """Login + submit one scheduled blog post via the PHP relay.
+
+    This is the high-level entry point used by ``src/main.py`` — it pulls
+    credentials and relay config from env vars (``SALON_BOARD_ID``,
+    ``SALON_BOARD_PASSWORD``, ``RELAY_URL``, ``RELAY_SECRET``) and wraps
+    the full ``login → submit_blog`` flow in a ``PostResult``.
+
+    Args:
+        title: Blog title (Salon Board enforces ≤ 50 chars / ≤ 全角25文字).
+        body: Plain-text body. Gets converted to nicEdit-style HTML.
+        image_path: Optional image to upload as the post's image. ``None``
+            posts without an image.
+        publish_at: Scheduled publication datetime (JST). Must be within
+            Salon Board's ~14-day window and on a 15-min slot outside
+            03:15–08:00.
+        poster: Author display name; must be in ``STAFF_IDS``.
+        category: Category label; must be in ``BLOG_CATEGORY_CODES``.
+
+    Returns:
+        ``PostResult``. On failure, ``error`` carries the underlying message
+        and the caller can decide whether to retry / notify / abort.
+    """
+    if poster not in STAFF_IDS:
+        return PostResult(
+            success=False,
+            error=f"Unknown poster {poster!r}; expected one of {sorted(STAFF_IDS)}",
+        )
+    if category not in BLOG_CATEGORY_CODES:
+        return PostResult(
+            success=False,
+            error=(
+                f"Unknown category {category!r}; expected one of "
+                f"{sorted(BLOG_CATEGORY_CODES)}"
+            ),
+        )
+
+    try:
+        relay_url, relay_secret = get_relay_config()
+        user_id, password = _require_credentials()
+    except RuntimeError as e:
+        return PostResult(success=False, error=str(e))
+
+    staff_id = STAFF_IDS[poster]
+    category_code = BLOG_CATEGORY_CODES[category]
+    body_html = _format_body_html(body)
+    images = [Path(image_path)] if image_path else None
+
+    log.info(
+        "post_blog_scheduled: poster=%s (%s), cat=%s (%s), publish_at=%s, img=%s",
+        poster, staff_id, category, category_code,
+        publish_at.isoformat(),
+        Path(image_path).name if image_path else "<none>",
+    )
+
+    relay = SalonBoardRelay(relay_url, relay_secret)
+    try:
+        login(relay, user_id, password)
+        final_url = submit_blog(
+            relay,
+            title=title,
+            body=body_html,
+            staff_id=staff_id,
+            reserve_dt=publish_at,
+            category_code=category_code,
+            image_paths=images,
+        )
+        return PostResult(success=True, final_url=final_url)
+    except (RuntimeError, ValueError, FileNotFoundError) as e:
+        log.exception("post_blog_scheduled failed: %s", e)
+        return PostResult(success=False, error=str(e))

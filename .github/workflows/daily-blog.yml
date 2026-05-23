@@ -43,11 +43,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browser
-        # Firefox (NOT Chromium): Akamai on salonboard.com silently drops
-        # Chromium TLS fingerprints. Firefox passes — verified Jan 2026.
-        run: python -m playwright install --with-deps firefox
-
       - name: Run unit tests
         run: pytest -q
 
@@ -58,6 +53,11 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
           SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+          # お名前.com PHP relay (Japan IP) — required because Akamai on
+          # salonboard.com silently drops POSTs from US-IP GitHub runners.
+          # See relay/README.md for setup.
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           # Optional overrides (Repo Variables)
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
@@ -89,8 +89,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: daily-blog-failure-${{ github.run_id }}
-          path: |
-            output/
-            screenshots/
+          path: output/
           if-no-files-found: warn
           retention-days: 14
