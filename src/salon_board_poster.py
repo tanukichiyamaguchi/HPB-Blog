@@ -106,26 +106,29 @@ LOGIN_PW_SELECTORS: tuple[str, ...] = (
     "input[type='password']:visible",
 )
 LOGIN_SUBMIT_SELECTORS: tuple[str, ...] = (
-    # Most specific first — the exact Salon Board primary button class.
-    "a.common-CNCcommon__primaryBtn:has-text('ログイン')",
+    # Salon Board submit is an <a> element with primaryBtn class (verified
+    # via D3 diagnostic: input[type='submit'] / button[type='submit'] were
+    # both NOT visible on the page).
+    # Scope everything to `form` first so we never accidentally match a
+    # header / navigation / help link.
+    "form a.common-CNCcommon__primaryBtn",
+    "form a.common-CNCcommon__primaryBtn:has-text('ログイン')",
+    "form a[onclick*='login' i]",
+    "form a[onclick*='submit' i]",
+    "form a:text-is('ログイン')",
+    # Form-scoped, excluding help / forgot-password links.
+    "form a:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない')):not(:has-text('忘れ'))",
+    # Fall back to unscoped (only if no <form> element exists)
     "a.common-CNCcommon__primaryBtn",
-    # JS-bound anchor (no href, onclick handler)
+    "a.common-CNCcommon__primaryBtn:has-text('ログイン')",
     "a[onclick*='login' i]",
     "a[onclick*='submit' i]",
-    # Text-based matches (exact then contains)
-    "a:text-is('ログイン')",
-    "button:text-is('ログイン')",
-    "a:has-text('ログイン')",
-    "button:has-text('ログイン')",
-    # Standard form submits
-    "input[type='submit'][value*='ログイン']",
+    # Last resort: standard form submits (D3 said these are not visible
+    # for Salon Board, but kept for robustness in case the UI changes).
+    "form input[type='submit']",
+    "form button[type='submit']",
     "input[type='submit']",
     "button[type='submit']",
-    "form button:not([type='button'])",
-    # As a wide net, any clickable element whose text starts with ログイン
-    # (avoiding "ログインできない" or "ログインでお困り" help links).
-    "a:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない')):not(:has-text('忘れ'))",
-    "button:has-text('ログイン'):not(:has-text('お困り')):not(:has-text('できない')):not(:has-text('忘れ'))",
 )
 
 POSTER_SELECT_SELECTORS: tuple[str, ...] = (
@@ -438,6 +441,14 @@ class SalonBoardPoster:
                 log.debug("Click %s with %s failed: %s", label, sel, e)
         log.warning("Could not click %s with any of %d selectors", label, len(selectors))
         return False
+
+    def _safe_eval(self, page: Page, expression: str) -> Any:
+        """Evaluate JS, swallowing exceptions (returns None on failure)."""
+        try:
+            return page.evaluate(expression)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Safe eval failed for %r: %s", expression, e)
+            return None
 
     def _dump_form_html(self, page: Page, label: str) -> None:
         """Save the relevant form's outerHTML so selector mismatches can be diagnosed.
@@ -795,6 +806,12 @@ class SalonBoardPoster:
         )
         self._screenshot(page, "01_login_page")
 
+        # Always dump the initial form HTML so selector mismatches can be
+        # diagnosed in a single iteration without needing artifact downloads.
+        # outerHTML does NOT include current input.value runtime state, so
+        # this is safe to keep in 14-day artifact retention.
+        self._dump_form_html(page, "01_login_initial")
+
         if not self._try_fill(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
             raise RuntimeError("Could not locate login ID input")
         if not self._try_fill(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
@@ -803,10 +820,20 @@ class SalonBoardPoster:
         # would render the salon's loginID in plaintext in Artifacts (retained 14d).
         # Password fields are masked by the browser, but the ID field is not.
 
+        # Detect if the page navigated to Firefox's internal neterror page
+        # (e.g. Akamai silently dropped a background request triggered by fill).
+        # Catching this early lets us fail with a precise message instead of
+        # spending 35s on doomed click attempts.
+        body_class = self._safe_eval(page, "document.body && document.body.className || ''")
+        if body_class and "neterror" in body_class:
+            raise RuntimeError(
+                f"Page became Firefox neterror after fill (body.class={body_class!r}); "
+                "likely Akamai blocked a background request from the login page."
+            )
+
         if not self._try_click(page, LOGIN_SUBMIT_SELECTORS, "login_submit"):
-            # Dump the form HTML to help diagnose missing selectors, then
-            # attempt JS-level form submission as a last resort.
-            self._dump_form_html(page, "login")
+            # Capture the post-fail state too (may have neterror or partial nav)
+            self._dump_form_html(page, "02_login_after_click_failures")
             if self._try_js_submit_login(page):
                 log.info("login_submit: succeeded via JS form.submit() fallback")
             else:
