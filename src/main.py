@@ -1,7 +1,12 @@
-"""Entry point. Phase 2: runs AI generation only (theme/blog/image)."""
+"""Entry point.
+
+Phase 2: AI generation only (theme/blog/image).
+Phase 3: Adds salon-board draft posting when ``RUN_SALON_BOARD_POST=draft``.
+"""
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,6 +23,14 @@ from src.utils import (
 )
 
 
+def _relpath_or_abs(target: Path, parent: Path) -> str:
+    """Return target relative to parent if possible, else absolute."""
+    try:
+        return str(target.relative_to(parent))
+    except ValueError:
+        return str(target)
+
+
 def run_generation() -> dict[str, Any]:
     log = setup_logging()
     now = get_jst_now()
@@ -27,7 +40,10 @@ def run_generation() -> dict[str, Any]:
     log.info("Output dir: %s", out_dir)
 
     theme = generate_theme(now=now)
-    log.info("Theme decided: %s (menu=%s, season=%s)", theme.theme, theme.menu_focus, theme.season)
+    log.info(
+        "Theme decided: %s (menu=%s, season=%s)",
+        theme.theme, theme.menu_focus, theme.season,
+    )
 
     blog = generate_blog(theme.theme)
     log.info("Blog title: %s", blog.title)
@@ -51,9 +67,7 @@ def run_generation() -> dict[str, Any]:
         "season": theme.season,
         "title": blog.title,
         "keywords": blog.keywords,
-        "image_path": str(image.path.relative_to(out_dir.parent.parent))
-            if out_dir.parent.parent in image.path.parents
-            else str(image.path),
+        "image_path": _relpath_or_abs(image.path, out_dir.parent.parent),
         "image_mime_type": image.mime_type,
     }
     write_json(meta_path, meta)
@@ -68,6 +82,8 @@ def run_generation() -> dict[str, Any]:
     return {
         "out_dir": str(out_dir),
         "theme": theme.to_dict(),
+        "blog": blog,
+        "image": image,
         "title": blog.title,
         "blog_path": str(blog_path),
         "image_path": str(image.path),
@@ -75,12 +91,50 @@ def run_generation() -> dict[str, Any]:
     }
 
 
+def run_salon_board_draft(generation: dict[str, Any]) -> dict[str, Any]:
+    """Post the generated content to Salon Board as DRAFT (Phase 3)."""
+    # Imported lazily so Phase 2 runs (and unit tests) don't require Playwright.
+    from src.salon_board_poster import post_blog_as_draft
+
+    log = logging.getLogger("hpb-blog.main")
+    blog = generation["blog"]
+    image_path = Path(generation["image_path"])
+
+    log.info("=== Salon Board draft posting start ===")
+    result = post_blog_as_draft(
+        title=blog.title,
+        body=blog.body,
+        image_path=image_path,
+        headless=True,
+    )
+    log.info(
+        "=== Salon Board draft posting done: success=%s, final_url=%s ===",
+        result.success, result.final_url,
+    )
+
+    # Persist a summary of what happened
+    out_dir = Path(generation["out_dir"])
+    write_json(out_dir / "salon_board_result.json", result.to_dict())
+    return result.to_dict()
+
+
 def main() -> int:
+    log = setup_logging()
+    mode = os.environ.get("RUN_SALON_BOARD_POST", "skip").strip().lower()
     try:
-        run_generation()
-    except Exception as e:
-        log = logging.getLogger("hpb-blog.main")
-        log.exception("Generation failed: %s", e)
+        generation = run_generation()
+
+        if mode == "draft":
+            sb_result = run_salon_board_draft(generation)
+            if not sb_result.get("success"):
+                log.error("Salon Board posting failed: %s", sb_result.get("error"))
+                return 2
+        elif mode == "skip":
+            log.info("RUN_SALON_BOARD_POST=skip; salon-board step bypassed")
+        else:
+            log.warning("Unknown RUN_SALON_BOARD_POST=%r; bypassing salon-board step", mode)
+    except Exception as e:  # noqa: BLE001
+        log.exception("Pipeline failed: %s", e)
         return 1
     return 0
 
