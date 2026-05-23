@@ -219,6 +219,19 @@ class PostResult:
         }
 
 
+@dataclass
+class BatchPostItem:
+    """One unit of work for ``SalonBoardPoster.post_batch_scheduled``."""
+    title: str
+    body: str
+    image_path: Path
+    scheduled_dt: datetime
+    poster: str
+    category: str = "おすすめメニュー"
+    # Per-item label used for naming screenshots so debug artifacts don't collide.
+    label: str = ""
+
+
 # --- Helpers (pure, testable) --------------------------------------------- #
 
 
@@ -484,6 +497,124 @@ class SalonBoardPoster:
             title, body, image_path, scheduled_dt=scheduled_dt,
             poster=poster, category=category,
         )
+
+    def post_batch_scheduled(
+        self,
+        items: list[BatchPostItem],
+        *,
+        between_items_pause_sec: float = 5.0,
+    ) -> list[PostResult]:
+        """Login once, then post each scheduled item in sequence.
+
+        Used for the weekly-batch workflow where the user runs the script on
+        their PC and 7 days of posts are scheduled in one browser session.
+
+        Failure isolation: if item N fails we continue with item N+1 — the
+        succeeded items remain valid scheduled posts in Salon Board.
+        """
+        if not items:
+            return []
+        for it in items:
+            if not it.title:
+                raise ValueError("title is required for every batch item")
+            if not it.body:
+                raise ValueError("body is required for every batch item")
+            if not Path(it.image_path).exists():
+                raise FileNotFoundError(f"image_path missing: {it.image_path}")
+            if not it.poster:
+                raise ValueError("poster is required for every batch item")
+
+        log.info("Batch posting %d scheduled items", len(items))
+        http_preflight()
+
+        results: list[PostResult] = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=self.headless,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--lang=ja-JP",
+                ],
+            )
+            try:
+                context = browser.new_context(
+                    locale="ja-JP",
+                    timezone_id="Asia/Tokyo",
+                    viewport={"width": 1280, "height": 800},
+                    user_agent=DEFAULT_USER_AGENT,
+                    extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5"},
+                )
+                context.add_init_script(_STEALTH_INIT_SCRIPT)
+                page = context.new_page()
+                page.set_default_timeout(self.timeout_ms)
+                page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
+
+                # 1. Single login
+                self._login(page)
+
+                # 2. Post each item
+                for idx, item in enumerate(items, start=1):
+                    item_label = item.label or item.scheduled_dt.strftime("%Y%m%d")
+                    log.info(
+                        "=== Batch item %d/%d (label=%s, publish=%s) ===",
+                        idx, len(items), item_label, item.scheduled_dt.isoformat(),
+                    )
+                    # Reset per-item screenshot state so each item has its own series.
+                    self._step = 0
+                    prior_screenshots = list(self._screenshots)
+                    self._screenshots = []
+                    # Stash per-item screenshots under day-prefixed subdir
+                    original_dir = self.screenshots_dir
+                    self.screenshots_dir = original_dir / f"day{idx:02d}_{item_label}"
+
+                    try:
+                        self._navigate_to_blog_new(page)
+                        self._fill_form(
+                            page,
+                            title=item.title,
+                            body=item.body,
+                            image_path=Path(item.image_path),
+                            poster=item.poster,
+                            category=item.category,
+                            scheduled_dt=item.scheduled_dt,
+                        )
+                        final_url = self._submit_and_finalize(page, item.scheduled_dt)
+                        results.append(PostResult(
+                            success=True,
+                            final_url=final_url,
+                            screenshots=list(self._screenshots),
+                        ))
+                        log.info("Batch item %d/%d posted: %s", idx, len(items), final_url)
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("Batch item %d/%d failed: %s", idx, len(items), e)
+                        try:
+                            self._screenshot(page, "error_state")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        results.append(PostResult(
+                            success=False,
+                            error=f"{type(e).__name__}: {e}",
+                            screenshots=list(self._screenshots),
+                        ))
+                    finally:
+                        # Restore parent screenshots dir and accumulate
+                        prior_screenshots.extend(self._screenshots)
+                        self._screenshots = prior_screenshots
+                        self.screenshots_dir = original_dir
+
+                    # Throttle between items to avoid tripping any rate limit
+                    if idx < len(items):
+                        try:
+                            page.wait_for_timeout(int(between_items_pause_sec * 1000))
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                return results
+            finally:
+                browser.close()
 
     def _post(
         self,
