@@ -254,6 +254,109 @@ jobs:
                   print(f"  POST {p:25s} → ❌ {type(e).__name__}")
           PYEOF
 
+      - name: '[7] CRITICAL: POST doLogin without trailing slash'
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          # In [2] we discovered that GET /CNC/login/doLogin (NO trailing slash)
+          # returns HTTP 200 (3314b), while /CNC/login/doLogin/ (with trailing
+          # slash) is silently dropped on POST. Akamai WAF rules are typically
+          # path-literal, so /doLogin and /doLogin/ are DIFFERENT URLs to it.
+          # If our doLogin POST works without trailing slash, we've found the
+          # bypass.
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import os
+
+          uid = os.environ["SALON_BOARD_ID"]
+          pw = os.environ["SALON_BOARD_PASSWORD"]
+
+          session = requests.Session()
+          print("--- Seed cookies via GET /login/ ---")
+          try:
+              session.get("https://salonboard.com/login/",
+                          impersonate="firefox133",
+                          headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                          timeout=15)
+              print(f"  Seeded: {list(session.cookies.keys())}")
+          except Exception as e:
+              print(f"  ❌ Seed failed: {e}")
+              import sys; sys.exit(0)
+
+          # Try multiple URL variations
+          targets = [
+              "https://salonboard.com/CNC/login/doLogin",      # NEW: no trailing slash ⭐
+              "https://salonboard.com/CNC/login/doLogin/",     # known blocked
+              "https://salonboard.com/cnc/login/doLogin",      # lowercase /cnc/, no slash
+              "https://salonboard.com/CNC/login/doLogin?",     # trailing ? ('s also a path variation)
+              "https://salonboard.com/CNC/login/doLogin/?",    # trailing /?
+              "https://salonboard.com/CNC/login/doLogin/#",    # trailing /#
+              "https://salonboard.com/CNC/Login/doLogin",      # capital L
+          ]
+
+          for url in targets:
+              print(f"\n--- POST {url} ---")
+              try:
+                  r = session.post(
+                      url,
+                      impersonate="firefox133",
+                      data={"userId": uid, "password": pw},
+                      headers={
+                          "Origin": "https://salonboard.com",
+                          "Referer": "https://salonboard.com/login/",
+                          "Accept-Language": "ja-JP,ja;q=0.9",
+                          "Content-Type": "application/x-www-form-urlencoded",
+                      },
+                      timeout=15,
+                      allow_redirects=False,
+                  )
+                  loc = r.headers.get("Location") or r.headers.get("location") or ""
+                  setcookies = r.headers.get("Set-Cookie") or ""
+                  print(f"  ✅ HTTP {r.status_code}, body={len(r.text)}b, Location={loc!r}")
+                  # If Set-Cookie has JSESSIONID set/refreshed, that's a strong auth signal
+                  if "JSESSIONID" in setcookies:
+                      print(f"  🎉 Set-Cookie has JSESSIONID: {setcookies[:200]}")
+                  if 300 <= r.status_code < 400 and loc and "login" not in loc.lower():
+                      print(f"  🎉 REDIRECT TO NON-LOGIN URL — LOGIN SUCCESS!")
+                      # Save body for analysis
+                      with open(f"posted_{url.split('/')[-1] or 'root'}.html", "w") as f:
+                          f.write(r.text)
+                  elif r.status_code == 200 and len(r.text) > 1000:
+                      print(f"  Body preview: {r.text[:300].replace(chr(10), ' ')!r}")
+              except Exception as e:
+                  print(f"  ❌ {type(e).__name__}: {str(e)[:120]}")
+          PYEOF
+
+      - name: '[8] GET /CNC/login/doLogin (no slash) - see what HTTP 200 actually means'
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          print("=== GET https://salonboard.com/CNC/login/doLogin (no trailing slash) ===")
+          try:
+              r = requests.get(
+                  "https://salonboard.com/CNC/login/doLogin",
+                  impersonate="firefox133",
+                  headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                  timeout=15,
+                  allow_redirects=False,
+              )
+              print(f"HTTP {r.status_code}, body={len(r.text)}b, final_url={r.url}")
+              loc = r.headers.get("Location") or ""
+              print(f"Location: {loc!r}")
+              print(f"Set-Cookie: {r.headers.get('Set-Cookie', '')[:200]}")
+              # First 1500 chars of body
+              print(f"\nBody preview (first 1500):")
+              print(r.text[:1500])
+              with open("doLogin_no_slash.html", "w", encoding="utf-8") as f:
+                  f.write(r.text)
+          except Exception as e:
+              print(f"❌ {type(e).__name__}: {e}")
+          PYEOF
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+
       - name: Upload discovery artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -262,4 +365,6 @@ jobs:
           path: |
             login_sp.html
             ats_login.html
+            doLogin_no_slash.html
+            posted_*.html
           if-no-files-found: ignore
