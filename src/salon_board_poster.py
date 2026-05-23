@@ -52,6 +52,13 @@ SALON_BOARD_LOGIN_URL = _env_url(
     "SALON_BOARD_LOGIN_URL",
     "https://salonboard.com/login/",
 )
+# POST endpoint that the page's `dologin()` JS submits to. Discovered via the
+# Playwright neterror diagnostic (page URL transitioned to this before Akamai
+# silently dropped the response).
+SALON_BOARD_LOGIN_POST_URL = _env_url(
+    "SALON_BOARD_LOGIN_POST_URL",
+    "https://salonboard.com/CNC/login/doLogin/",
+)
 SALON_BOARD_BLOG_NEW_URL = _env_url(
     "SALON_BOARD_BLOG_NEW_URL",
     "https://salonboard.com/KLP/blog/blog/",
@@ -950,113 +957,146 @@ class SalonBoardPoster:
         page.wait_for_timeout(1000)
         self._log_akamai_cookies(page, "after_load")
 
-        # Phase 2: human-like interaction to feed Akamai's behavioural sensor.
-        # Without this, _abck stays at '~-1' (challenge pending) and the POST
-        # endpoint silently drops the request. We then poll _abck until it
-        # transitions away from '-1' — or up to 20s, then proceed regardless.
+        # Phase 2: brief human interaction (helps _abck grow even if not validated).
+        # We don't wait long here because the hybrid curl_cffi POST below is the
+        # actual login path — Playwright's POST is silently dropped by Akamai
+        # regardless of _abck state (verified empirically).
         log.info("Simulating human interaction to advance Akamai sensor...")
         self._simulate_human_interaction(page)
-        if self._wait_for_akamai_validation(page, max_wait_s=20):
-            log.info("_abck validated — Akamai sensor accepted the client")
-        else:
-            log.warning("_abck not validated within 20s — POST may still be dropped")
+        page.wait_for_timeout(2000)
         self._log_akamai_cookies(page, "after_human_sim")
 
-        # Phase 3: type credentials with realistic per-key delay so the sensor
-        # observes keydown/keypress/keyup (fill() does NOT fire these).
-        if not self._type_into(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
-            # Fallback to .fill() if .type() couldn't find inputs.
-            if not self._try_fill(page, LOGIN_ID_SELECTORS, self.user_id, "login_id"):
-                raise RuntimeError("Could not locate login ID input")
-        if not self._type_into(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
-            if not self._try_fill(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
-                raise RuntimeError("Could not locate password input")
-        # NOTE: no "02_login_filled" screenshot — would leak loginID in artifacts.
-
-        # Give Akamai 1-2 more seconds to process the keypress burst.
-        page.wait_for_timeout(1500)
-
-        # Detect early if a background request put the page in Firefox's neterror.
-        body_class = self._safe_eval(page, "document.body && document.body.className || ''")
-        if body_class and "neterror" in body_class:
+        # Phase 3: hybrid login. POST credentials via curl_cffi (Firefox TLS
+        # impersonation) instead of via Playwright. Playwright submit causes
+        # Akamai to silently drop the POST; curl_cffi with the same cookies
+        # bypasses this (verified: Job A diagnostic returned HTTP 200 with
+        # firefox133 impersonation).
+        if not self._login_via_curl_cffi(page):
             raise RuntimeError(
-                f"Page became Firefox neterror after fill (body.class={body_class!r}); "
-                "Akamai likely blocked a background request from the login page."
+                "Hybrid curl_cffi login failed. See preceding log lines for "
+                "the HTTP status / redirect / cookies returned by Akamai."
             )
-        self._log_akamai_cookies(page, "after_typing")
-
-        # ----- Submit (three strategies, each with no_wait_after so we don't
-        #       hang waiting for navigation that Akamai might silently drop). -----
-        submitted_via: str | None = None
-
-        # Strategy 1: click the verified login button selector.
-        for sel in LOGIN_SUBMIT_SELECTORS:
-            try:
-                page.locator(sel).first.click(
-                    timeout=5000,
-                    # CRITICAL: don't wait for navigation after click. Akamai
-                    # may silently drop the POST; without this flag, click()
-                    # hangs for `timeout` ms even though the click landed.
-                    no_wait_after=True,
-                )
-                submitted_via = f"click({sel})"
-                log.info("login_submit: clicked %s", sel)
-                break
-            except Exception as e:  # noqa: BLE001
-                log.debug("login_submit click %s failed: %s", sel, e)
-
-        # Strategy 2: press Enter on the password field. The page has
-        # onkeypress="enterActionLogin(event)" on both inputs, so Enter
-        # triggers the same submit path as the button.
-        if submitted_via is None:
-            try:
-                page.locator("input[name='password']").first.press(
-                    "Enter", timeout=3000, no_wait_after=True,
-                )
-                submitted_via = "keypress(Enter on password)"
-                log.info("login_submit: triggered via Enter keypress")
-            except Exception as e:  # noqa: BLE001
-                log.debug("login_submit Enter-keypress failed: %s", e)
-
-        # Strategy 3: call dologin() directly via JS.
-        if submitted_via is None:
-            result = self._safe_eval(page, """() => {
-                if (typeof dologin !== 'function') return {ok: false, reason: 'dologin undefined'};
-                try { dologin(new Event('click')); return {ok: true}; }
-                catch (e) { return {ok: false, reason: String(e)}; }
-            }""")
-            if result and result.get("ok"):
-                submitted_via = "js(dologin)"
-                log.info("login_submit: triggered via JS dologin()")
-            else:
-                log.warning("login_submit JS dologin failed: %s", result)
-
-        if submitted_via is None:
-            self._dump_form_html(page, "02_no_submit_method_worked")
-            raise RuntimeError(
-                "All login submit strategies failed (click / Enter keypress / JS dologin)"
-            )
-
-        # ----- Wait for login completion or hard-fail -----
-        if not self._wait_for_login_complete(page, timeout_s=45):
-            self._dump_form_html(page, "03_login_did_not_complete")
-            self._log_akamai_cookies(page, "after_failed_submit")
-            body_cls = self._safe_eval(page, "document.body && document.body.className || ''") or ""
-            url = page.url
-            if "neterror" in body_cls:
-                raise RuntimeError(
-                    f"Login POST was silently dropped by Akamai "
-                    f"(Firefox neterror after submit via {submitted_via}; url={url}). "
-                    "TLS fingerprint passes for GET but POST is blocked. "
-                    "Next step: switch login to curl_cffi HTTP-only flow."
-                )
-            raise RuntimeError(
-                f"Login did not complete within 45s (submitted via {submitted_via}, "
-                f"still at url={url}, body.class={body_cls!r})"
-            )
-        log.info("Login complete via %s; url=%s", submitted_via, page.url)
+        log.info("Hybrid curl_cffi login complete; Playwright url=%s", page.url)
         self._wait_idle(page)
         self._screenshot(page, "03_after_login")
+
+    def _login_via_curl_cffi(self, page: Page) -> bool:
+        """Hybrid login: extract Playwright cookies, POST via curl_cffi, re-inject.
+
+        Why hybrid: Playwright Firefox's POST to /CNC/login/doLogin/ is silently
+        dropped by Akamai (verified empirically — Firefox neterror after 30s).
+        But curl_cffi with firefox133 impersonation passes Akamai for GET (Job A
+        diagnostic). Combining these gives us:
+          - Playwright loads the page → Akamai sets _abck, ak_bmsc, bm_sz cookies
+          - curl_cffi POSTs with those cookies → Akamai sees a recognised session
+          - Response cookies (JSESSIONID etc.) are injected back into Playwright
+          - Playwright then navigates to the post-login page for the rest of the flow
+        """
+        try:
+            from curl_cffi import requests as cffi_requests  # type: ignore[import-untyped]
+        except ImportError:
+            log.error("curl_cffi not installed; cannot do hybrid login")
+            return False
+
+        pw_cookies = page.context.cookies()
+        cookie_dict = {c["name"]: c["value"] for c in pw_cookies}
+        log.info(
+            "curl_cffi login: %d cookies from Playwright (akamai: _abck=%s ak_bmsc=%s bm_sz=%s)",
+            len(cookie_dict),
+            "yes" if "_abck" in cookie_dict else "no",
+            "yes" if "ak_bmsc" in cookie_dict else "no",
+            "yes" if "bm_sz" in cookie_dict else "no",
+        )
+
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            "Origin": "https://salonboard.com",
+            "Referer": SALON_BOARD_LOGIN_URL,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        data = {
+            "userId": self.user_id,
+            "password": self.password,
+        }
+        try:
+            resp = cffi_requests.post(
+                SALON_BOARD_LOGIN_POST_URL,
+                impersonate="firefox133",
+                cookies=cookie_dict,
+                headers=headers,
+                data=data,
+                timeout=30,
+                allow_redirects=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.error("curl_cffi POST raised: %s: %s", type(e).__name__, e)
+            return False
+
+        loc = resp.headers.get("Location") or resp.headers.get("location") or ""
+        log.info(
+            "curl_cffi POST: HTTP %s, Location=%r, body_len=%d",
+            resp.status_code, loc, len(resp.text or ""),
+        )
+
+        # Capture any new cookies (JSESSIONID, refreshed _abck, etc.).
+        new_cookies: list[dict[str, Any]] = []
+        try:
+            for c in resp.cookies.jar:
+                new_cookies.append({
+                    "name": c.name,
+                    "value": c.value or "",
+                    "domain": c.domain or ".salonboard.com",
+                    "path": c.path or "/",
+                    "secure": bool(getattr(c, "secure", False)),
+                })
+        except Exception:  # noqa: BLE001
+            for name, value in resp.cookies.items():
+                new_cookies.append({
+                    "name": name, "value": value,
+                    "domain": ".salonboard.com", "path": "/",
+                })
+        if new_cookies:
+            try:
+                page.context.add_cookies(new_cookies)
+                log.info("Injected %d response cookies into Playwright", len(new_cookies))
+            except Exception as e:  # noqa: BLE001
+                log.warning("Cookie injection failed: %s", e)
+
+        # Login success heuristic: HTTP redirect (302/303) to a non-login URL.
+        if resp.status_code in (301, 302, 303) and loc:
+            target = loc if loc.startswith("http") else f"https://salonboard.com{loc}"
+            if "/login" in target.lower():
+                log.warning(
+                    "Login redirected back to a login-related URL (%s); credentials may be wrong",
+                    target,
+                )
+                # Dump first chunk of redirect target for diagnostics
+                body_preview = (resp.text or "")[:500].replace("\n", " ")
+                if body_preview:
+                    log.warning("POST response body preview: %s", body_preview)
+                return False
+            log.info("Login success; navigating Playwright to %s", target)
+            try:
+                page.goto(target, timeout=30000, wait_until="domcontentloaded")
+            except Exception as e:  # noqa: BLE001
+                log.error("Post-login navigation to %s failed: %s", target, e)
+                return False
+            return True
+
+        # HTTP 200 with no redirect = the login page re-rendered with an error.
+        if resp.status_code == 200:
+            body_preview = (resp.text or "")[:800].replace("\n", " ")
+            log.warning("Login POST returned 200 (no redirect). Body preview: %s", body_preview)
+            return False
+
+        # Anything else (e.g. 403, 503, timeout-as-error) → fail with full info.
+        log.warning(
+            "Unexpected POST status %s. Headers: %s",
+            resp.status_code, dict(resp.headers),
+        )
+        return False
 
         # Precise login-success check: we must have NAVIGATED AWAY from the
         # original login URL. A substring match on "login" would false-positive
