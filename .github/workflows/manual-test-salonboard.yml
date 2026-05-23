@@ -3,6 +3,14 @@ name: Manual Test (Salon Board Draft Post)
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Salon Board mode"
+        required: true
+        default: "draft"
+        type: choice
+        options:
+          - draft
+          - schedule
       log_level:
         description: "Log level"
         required: false
@@ -43,14 +51,16 @@ jobs:
       - name: Run unit tests (no API needed)
         run: pytest -q
 
-      - name: Run generation + draft post
+      - name: Run generation + Salon Board (${{ inputs.mode }})
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
           SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
-          RUN_SALON_BOARD_POST: draft
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_SALON_BOARD_POST: ${{ inputs.mode }}
           LOG_LEVEL: ${{ inputs.log_level }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python -m src.main
 
       - name: Upload artifacts

@@ -1,7 +1,7 @@
 """Salon Board automation via Playwright.
 
 Phase 3 scope: login → blog new → fill (title/body/image) → save AS DRAFT.
-Scheduled posting is intentionally deferred to Phase 5.
+Phase 5 scope: same flow but sets publish datetime and saves as SCHEDULED post.
 
 Selectors are best-effort with multiple fallbacks. Each step writes a screenshot
 to ``screenshots/`` so failures can be diagnosed and selectors refined iteratively.
@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -96,6 +97,39 @@ DRAFT_SAVE_SELECTORS: tuple[str, ...] = (
     "a:has-text('下書き保存')",
     "button:has-text('下書き')",
     "input[value*='下書き']",
+)
+SCHEDULE_SAVE_SELECTORS: tuple[str, ...] = (
+    "button:has-text('予約投稿')",
+    "input[value='予約投稿']",
+    "button:has-text('予約')",
+    "input[value='予約']",
+    "button:has-text('投稿予約')",
+    "a:has-text('予約投稿')",
+)
+PUBLISH_DATE_SELECTORS: tuple[str, ...] = (
+    "input[type='date']",
+    "input[name*='publish_date']",
+    "input[name*='postDate']",
+    "input[name*='reserveDate']",
+    "input[name*='publishDate']",
+)
+PUBLISH_HOUR_SELECTORS: tuple[str, ...] = (
+    "select[name*='hour']",
+    "select[name*='publish_hour']",
+    "select[name*='postHour']",
+    "select[name*='reserveHour']",
+)
+PUBLISH_MINUTE_SELECTORS: tuple[str, ...] = (
+    "select[name*='minute']",
+    "select[name*='publish_minute']",
+    "select[name*='postMinute']",
+    "select[name*='reserveMinute']",
+)
+SCHEDULE_RADIO_SELECTORS: tuple[str, ...] = (
+    "input[type='radio'][value='reserve']",
+    "input[type='radio'][value='schedule']",
+    "label:has-text('予約投稿')",
+    "input[type='radio'][value='2']",
 )
 CONFIRM_DIALOG_SELECTORS: tuple[str, ...] = (
     "button:has-text('はい')",
@@ -231,6 +265,24 @@ class SalonBoardPoster:
     # ----- public entry ----- #
 
     def post_as_draft(self, title: str, body: str, image_path: Path) -> PostResult:
+        return self._post(title, body, image_path, scheduled_dt=None)
+
+    def post_as_scheduled(
+        self,
+        title: str,
+        body: str,
+        image_path: Path,
+        scheduled_dt: datetime,
+    ) -> PostResult:
+        return self._post(title, body, image_path, scheduled_dt=scheduled_dt)
+
+    def _post(
+        self,
+        title: str,
+        body: str,
+        image_path: Path,
+        scheduled_dt: datetime | None,
+    ) -> PostResult:
         if not title:
             raise ValueError("title is required")
         if not body:
@@ -257,7 +309,11 @@ class SalonBoardPoster:
                 self._login(page)
                 self._navigate_to_blog_new(page)
                 self._fill_blog_form(page, title, body, image_path)
-                final_url = self._save_as_draft(page)
+                if scheduled_dt is None:
+                    final_url = self._save_as_draft(page)
+                else:
+                    self._set_scheduled_datetime(page, scheduled_dt)
+                    final_url = self._save_as_scheduled(page)
 
                 return PostResult(
                     success=True,
@@ -347,8 +403,68 @@ class SalonBoardPoster:
 
         return page.url
 
+    def _set_scheduled_datetime(self, page: Page, scheduled_dt: datetime) -> None:
+        """Select 予約投稿 mode and set publish date/time. Phase 5 — selectors TBD."""
+        log.info("Setting scheduled datetime: %s", scheduled_dt.isoformat())
+
+        # Toggle to schedule mode (radio / tab)
+        self._try_click(page, SCHEDULE_RADIO_SELECTORS, "schedule_radio")
+        self._screenshot(page, "08_schedule_mode_selected")
+
+        date_str = scheduled_dt.strftime("%Y-%m-%d")
+        hour_str = f"{scheduled_dt.hour:02d}"
+        minute_str = f"{scheduled_dt.minute:02d}"
+
+        if not self._try_fill(page, PUBLISH_DATE_SELECTORS, date_str, "publish_date"):
+            log.warning("Could not set publish_date; may need different selector")
+
+        for sel in PUBLISH_HOUR_SELECTORS:
+            try:
+                page.locator(sel).first.select_option(
+                    value=hour_str, timeout=self.per_selector_timeout_ms,
+                )
+                log.info("Selected hour=%s via %s", hour_str, sel)
+                break
+            except Exception as e:  # noqa: BLE001
+                log.debug("Hour select %s failed: %s", sel, e)
+
+        for sel in PUBLISH_MINUTE_SELECTORS:
+            try:
+                page.locator(sel).first.select_option(
+                    value=minute_str, timeout=self.per_selector_timeout_ms,
+                )
+                log.info("Selected minute=%s via %s", minute_str, sel)
+                break
+            except Exception as e:  # noqa: BLE001
+                log.debug("Minute select %s failed: %s", sel, e)
+
+        self._screenshot(page, "09_schedule_datetime_set")
+
+    def _save_as_scheduled(self, page: Page) -> str | None:
+        log.info("Clicking scheduled-save button")
+        if not self._try_click(page, SCHEDULE_SAVE_SELECTORS, "schedule_save"):
+            raise RuntimeError("Could not locate schedule-save button")
+        self._wait_idle(page)
+        self._screenshot(page, "10_after_schedule_save")
+
+        if self._try_click(page, CONFIRM_DIALOG_SELECTORS, "confirm_dialog"):
+            self._wait_idle(page)
+            self._screenshot(page, "11_after_confirm")
+
+        return page.url
+
 
 # --- Convenience function -------------------------------------------------- #
+
+
+def _require_credentials() -> tuple[str, str]:
+    user_id = os.environ.get("SALON_BOARD_ID")
+    password = os.environ.get("SALON_BOARD_PASSWORD")
+    if not user_id or not password:
+        raise RuntimeError(
+            "SALON_BOARD_ID and SALON_BOARD_PASSWORD environment variables are required",
+        )
+    return user_id, password
 
 
 def post_blog_as_draft(
@@ -358,11 +474,19 @@ def post_blog_as_draft(
     *,
     headless: bool = True,
 ) -> PostResult:
-    user_id = os.environ.get("SALON_BOARD_ID")
-    password = os.environ.get("SALON_BOARD_PASSWORD")
-    if not user_id or not password:
-        raise RuntimeError(
-            "SALON_BOARD_ID and SALON_BOARD_PASSWORD environment variables are required",
-        )
+    user_id, password = _require_credentials()
     poster = SalonBoardPoster(user_id, password, headless=headless)
     return poster.post_as_draft(title, body, image_path)
+
+
+def post_blog_scheduled(
+    title: str,
+    body: str,
+    image_path: Path,
+    scheduled_dt: datetime,
+    *,
+    headless: bool = True,
+) -> PostResult:
+    user_id, password = _require_credentials()
+    poster = SalonBoardPoster(user_id, password, headless=headless)
+    return poster.post_as_scheduled(title, body, image_path, scheduled_dt)

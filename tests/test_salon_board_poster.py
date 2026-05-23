@@ -82,3 +82,27 @@ def test_post_as_draft_rejects_missing_image(tmp_path: Path):
     p = SalonBoardPoster("uid", "pw")
     with pytest.raises(FileNotFoundError):
         p.post_as_draft("title", "body", tmp_path / "missing.png")
+
+
+def test_post_as_scheduled_rejects_empty_inputs(tmp_path: Path):
+    from datetime import datetime
+
+    image = tmp_path / "img.png"
+    image.write_bytes(b"\x89PNG")
+    p = SalonBoardPoster("uid", "pw")
+    dt = datetime(2026, 6, 16, 8, 15)
+    with pytest.raises(ValueError):
+        p.post_as_scheduled("", "body", image, dt)
+    with pytest.raises(ValueError):
+        p.post_as_scheduled("title", "", image, dt)
+
+
+def test_post_as_scheduled_rejects_missing_image(tmp_path: Path):
+    from datetime import datetime
+
+    p = SalonBoardPoster("uid", "pw")
+    with pytest.raises(FileNotFoundError):
+        p.post_as_scheduled(
+            "title", "body", tmp_path / "missing.png",
+            datetime(2026, 6, 16, 8, 15),
+        )
