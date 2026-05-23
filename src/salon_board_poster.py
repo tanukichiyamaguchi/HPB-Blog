@@ -200,14 +200,6 @@ PREVIEW_SCHEDULE_POST_SELECTORS: tuple[str, ...] = (
     "a:has-text('予約する')",
 )
 
-# Optional: dismiss the "ログインでお困りですか？" helper panel if it blocks anything.
-LOGIN_HELP_DISMISS_SELECTORS: tuple[str, ...] = (
-    "button[aria-label='閉じる']",
-    ".help-popup button.close",
-    "div.help-popup .close",
-)
-
-
 # --- Result --------------------------------------------------------------- #
 
 
@@ -454,7 +446,13 @@ class SalonBoardPoster:
         try:
             page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         except PWTimeout:
-            log.warning("networkidle wait timed out; continuing")
+            # Surface this clearly — silent swallowing previously hid the symptom
+            # that the page was stuck on a never-completing subresource.
+            log.warning(
+                "networkidle wait of %dms timed out on %s; proceeding anyway "
+                "(some background resource may still be loading)",
+                self.timeout_ms, page.url,
+            )
 
     # ----- public entry ----- #
 
@@ -589,14 +587,21 @@ class SalonBoardPoster:
             raise RuntimeError("Could not locate login ID input")
         if not self._try_fill(page, LOGIN_PW_SELECTORS, self.password, "login_pw"):
             raise RuntimeError("Could not locate password input")
-        self._screenshot(page, "02_login_filled")
+        # NOTE: deliberately skipping a "02_login_filled" screenshot because it
+        # would render the salon's loginID in plaintext in Artifacts (retained 14d).
+        # Password fields are masked by the browser, but the ID field is not.
 
         if not self._try_click(page, LOGIN_SUBMIT_SELECTORS, "login_submit"):
             raise RuntimeError("Could not locate login submit button")
         self._wait_idle(page)
         self._screenshot(page, "03_after_login")
 
-        if "login" in page.url.lower():
+        # Precise login-success check: we must have NAVIGATED AWAY from the
+        # original login URL. A substring match on "login" would false-positive
+        # on legitimate post-login paths like "/post-login/" or "/?from=login".
+        current_url = page.url.split("?")[0].split("#")[0].rstrip("/")
+        login_url = SALON_BOARD_LOGIN_URL.split("?")[0].split("#")[0].rstrip("/")
+        if current_url == login_url:
             raise RuntimeError(f"Login likely failed; still on {page.url}")
 
     def _navigate_to_blog_new(self, page: Page) -> None:

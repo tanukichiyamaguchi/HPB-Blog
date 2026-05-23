@@ -10,12 +10,13 @@ from typing import Any
 
 import requests
 
+from src.config import API_RETRY_ATTEMPTS, API_RETRY_BASE_DELAY_SEC
 from src.utils import retry
 
 log = logging.getLogger(__name__)
 
 
-SLACK_WEBHOOK_TIMEOUT_S = 10
+SLACK_WEBHOOK_TIMEOUT_S = int(os.environ.get("SLACK_WEBHOOK_TIMEOUT_S", "10"))
 
 
 @dataclass
@@ -37,7 +38,12 @@ def _post_to_slack(webhook_url: str, payload: dict[str, Any]) -> NotificationRes
         return resp
 
     try:
-        resp = retry(_call, max_attempts=3, base_delay=2.0, logger=log)
+        resp = retry(
+            _call,
+            max_attempts=API_RETRY_ATTEMPTS,
+            base_delay=API_RETRY_BASE_DELAY_SEC,
+            logger=log,
+        )
         return NotificationResult(sent=True, status_code=resp.status_code)
     except Exception as e:  # noqa: BLE001
         log.exception("Slack notification failed")

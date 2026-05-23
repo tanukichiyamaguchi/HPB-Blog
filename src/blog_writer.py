@@ -128,6 +128,11 @@ _SIGNATURE_SEPARATOR = "\n\n"
 _SIGNATURE_RESERVED_CHARS = len(_SIGNATURE_SEPARATOR) + len(SALON_SIGNATURE)
 # Char budget left for the LLM-generated body content.
 MAX_BODY_CONTENT_LENGTH = max(0, MAX_BODY_LENGTH - _SIGNATURE_RESERVED_CHARS)
+# HPB form caps newlines in 本文 at 80. The canonical signature contributes
+# a fixed count; we measure dynamically.
+MAX_BODY_NEWLINES = 80
+_SIGNATURE_NEWLINES = SALON_SIGNATURE.count("\n") + _SIGNATURE_SEPARATOR.count("\n")
+MAX_CONTENT_NEWLINES = max(0, MAX_BODY_NEWLINES - _SIGNATURE_NEWLINES)
 
 
 def strip_partial_signature(body: str) -> str:
@@ -142,6 +147,42 @@ def strip_partial_signature(body: str) -> str:
         if SIGNATURE_HORIZONTAL_RULE in line:
             return "\n".join(lines[:i]).rstrip()
     return body
+
+
+def enforce_newline_limit(content: str, max_newlines: int = MAX_CONTENT_NEWLINES) -> str:
+    """Collapse newlines so the content has ≤ max_newlines newlines.
+
+    HPB form caps 本文 at 改行80回以下. The canonical signature contributes a fixed
+    number; this leaves a budget for the LLM-written portion.
+
+    Three-step de-escalation, each preserving as much structure as possible:
+      1. Collapse 3+ consecutive newlines to 2 (kills only extra paragraph breaks).
+      2. Collapse 2+ consecutive newlines to 1 (removes paragraph breaks entirely).
+      3. Past-budget single newlines → replaced with spaces (joins lines).
+    """
+    import re
+
+    if content.count("\n") <= max_newlines:
+        return content
+    # Step 1
+    collapsed = re.sub(r"\n{3,}", "\n\n", content)
+    if collapsed.count("\n") <= max_newlines:
+        return collapsed
+    # Step 2
+    collapsed = re.sub(r"\n{2,}", "\n", collapsed)
+    if collapsed.count("\n") <= max_newlines:
+        return collapsed
+    # Step 3: hard cap by replacing surplus newlines with spaces.
+    if max_newlines <= 0:
+        return collapsed.replace("\n", " ")
+    parts = collapsed.split("\n")
+    # Keep the first (max_newlines + 1) parts separated by newlines, then join
+    # any remaining parts with single spaces (so no content is lost).
+    head = "\n".join(parts[: max_newlines + 1])
+    tail_parts = [p for p in parts[max_newlines + 1:] if p]
+    if not tail_parts:
+        return head
+    return head + " " + " ".join(tail_parts)
 
 
 def enforce_body_length(content: str, max_total: int = MAX_BODY_LENGTH) -> str:
@@ -221,8 +262,21 @@ def parse_blog(raw: str) -> BlogPost:
             original_len, MAX_BODY_CONTENT_LENGTH, len(body_content),
             _SIGNATURE_RESERVED_CHARS, len(body_content) + _SIGNATURE_RESERVED_CHARS, MAX_BODY_LENGTH,
         )
-    body = body_content + _SIGNATURE_SEPARATOR + SALON_SIGNATURE
+    if body_content.count("\n") > MAX_CONTENT_NEWLINES:
+        original_nl = body_content.count("\n")
+        body_content = enforce_newline_limit(body_content)
+        log.warning(
+            "Body newlines %d > %d; collapsed to %d (signature adds %d → total %d ≤ %d)",
+            original_nl, MAX_CONTENT_NEWLINES, body_content.count("\n"),
+            _SIGNATURE_NEWLINES, body_content.count("\n") + _SIGNATURE_NEWLINES, MAX_BODY_NEWLINES,
+        )
+    # Final assembly via the canonical signature appender (single source of truth,
+    # eliminates the prior dead-code dup with ensure_signature).
+    body = ensure_signature(body_content)
     assert len(body) <= MAX_BODY_LENGTH, f"body length {len(body)} exceeds {MAX_BODY_LENGTH}"
+    assert body.count("\n") <= MAX_BODY_NEWLINES, (
+        f"body newlines {body.count(chr(10))} exceeds {MAX_BODY_NEWLINES}"
+    )
 
     return BlogPost(title=title, keywords=keywords, body=body, raw=raw)
 

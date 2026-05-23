@@ -4,10 +4,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.blog_writer import (
+    MAX_BODY_NEWLINES,
+    MAX_CONTENT_NEWLINES,
     BlogPost,
     _parse_keywords,
     _parse_sections,
     enforce_body_length,
+    enforce_newline_limit,
     enforce_title_length,
     ensure_signature,
     generate_blog,
@@ -325,6 +328,64 @@ def test_parse_blog_short_content_unchanged():
     post = parse_blog(short_raw)
     assert "短い本文の内容です。" in post.body
     assert len(post.body) <= MAX_BODY_LENGTH
+
+
+def test_enforce_newline_limit_no_change_when_under():
+    text = "一行目\n二行目\n三行目"  # 2 newlines
+    assert enforce_newline_limit(text, max_newlines=80) == text
+
+
+def test_enforce_newline_limit_collapses_triple_to_double():
+    text = "a\n\n\n\nb\n\n\n\nc"
+    out = enforce_newline_limit(text, max_newlines=2)
+    # Should collapse 3+ to 2 in step 1
+    assert "\n\n\n" not in out
+
+
+def test_enforce_newline_limit_collapses_double_to_single_when_needed():
+    text = "a\n\nb\n\nc\n\nd\n\ne"  # 8 newlines (4 pairs)
+    out = enforce_newline_limit(text, max_newlines=3)
+    # Step 1 (\n{3,} → \n\n) doesn't help here; step 2 (\n{2,} → \n) kicks in
+    assert out.count("\n") <= 3
+
+
+def test_parse_blog_enforces_newline_limit():
+    """HPB form caps body at 改行80回以下. parse_blog must hold the line."""
+    # Make body content with way more than 80 newlines but small total char count
+    body_with_many_newlines = "\n".join(f"段落{i}" for i in range(200))  # 199 newlines
+    raw = f"""◆タイトル：
+タイトル
+
+◆使用キーワード：
+蒲田
+
+◆本文：
+{body_with_many_newlines}
+"""
+    post = parse_blog(raw)
+    assert post.body.count("\n") <= MAX_BODY_NEWLINES, (
+        f"body has {post.body.count(chr(10))} newlines; cap is {MAX_BODY_NEWLINES}"
+    )
+
+
+def test_parse_blog_uses_ensure_signature_not_inline():
+    """Regression: parse_blog should call ensure_signature() — not re-implement inline.
+
+    Verified indirectly by checking that the post body ends with the canonical
+    SALON_SIGNATURE and that ensure_signature() is still imported / referenced.
+    """
+    raw = """◆タイトル：
+タイトル
+
+◆使用キーワード：
+蒲田
+
+◆本文：
+本文の中身です。
+"""
+    post = parse_blog(raw)
+    # Final body must end with exactly the canonical signature
+    assert post.body.endswith(SALON_SIGNATURE)
 
 
 def test_ensure_signature_appends_when_missing():

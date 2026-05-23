@@ -101,7 +101,7 @@ python -m src.main
 
 ### 本番運用
 
-`.github/workflows/daily-blog.yml` の cron が JST 22:00 に自動起動します。
+`.github/workflows/daily-blog.yml` の cron が **JST 22:15**（UTC 13:15）に自動起動します。
 ジョブの進行は Actions タブで確認、Slack 通知でも結果が届きます。
 
 ### 手動テスト
@@ -111,7 +111,40 @@ python -m src.main
 ### スケジュール変更
 
 `daily-blog.yml` の cron 値を編集してください（UTC 表記）。
-例：JST 22:00 = UTC 13:00 → `cron: '0 13 * * *'`
+例：JST 22:15 = UTC 13:15 → `cron: '15 13 * * *'`
+
+## トラブルシューティング
+
+### Salon Board に接続できない（GitHub Actions ランナーから）
+
+GitHub Actions の公式ホストランナー（Microsoft Azure 米国 IP）からは
+`salonboard.com` への TCP 接続が遮断されます（リクルート社側の WAF 等
+による地理的ブロックと推定）。HTTP プリフライトログに
+`Read timed out` が出る場合がこれです。
+
+回避策（いずれも **日本IPからの実行** が必要）:
+
+1. **GitHub Actions self-hosted runner（推奨）**
+   日本国内の PC / VPS / クラウド VM 上に
+   [GitHub Actions runner](https://docs.github.com/actions/hosting-your-own-runners)
+   をインストールし、`daily-blog.yml` の `runs-on:` を
+   `self-hosted` または専用ラベルに変更。
+2. **日本リージョンの常時稼働 VM**（Oracle Cloud Tokyo Free Tier、
+   さくらのVPS、Conoha、AWS Lightsail Tokyo 等）に runner を配置。
+3. **日本IP出口プロキシ**（Bright Data の Japan residential 等、有料）を
+   `SALON_BOARD_PROXY` env で指定（コード側で受け取り口は実装済み）。
+
+### モデルが見つからない（404 / model_not_found）
+
+`CLAUDE_MODEL` / `GEMINI_IMAGE_MODEL` を Repo Variables で
+別の既知モデル名に上書き可能：
+
+- 例: `GEMINI_IMAGE_MODEL=gemini-2.5-flash-image-preview`
+
+### `LOG_LEVEL=DEBUG` でログを詳細化
+
+Repo Variables もしくは workflow_dispatch input で `LOG_LEVEL=DEBUG` を
+指定すると、セレクタ試行・各 retry の詳細などが出力されます。
 
 ## 制約事項
 

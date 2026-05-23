@@ -53,13 +53,21 @@ def _mode() -> str:
 
 
 def compute_next_publish_dt(now: datetime) -> datetime:
-    """Return tomorrow's 08:15 in the JST timezone."""
-    tomorrow = now.date() + timedelta(days=1)
-    return datetime.combine(
-        tomorrow,
+    """Return the next 08:15 in JST that is strictly after ``now``.
+
+    Normal cron fires at JST 22:15 → returns tomorrow 08:15.
+    If GitHub Actions delays the run past 08:15 the next morning (e.g. cron
+    queue backlog), we clamp forward by an extra day so we never schedule a
+    post in the past (which Salon Board would reject or silently drop).
+    """
+    candidate = datetime.combine(
+        now.date() + timedelta(days=1),
         time(SCHEDULED_PUBLISH_HOUR, SCHEDULED_PUBLISH_MINUTE, 0),
         tzinfo=JST,
     )
+    while candidate <= now:
+        candidate = candidate + timedelta(days=1)
+    return candidate
 
 
 def _relpath_or_abs(target: Path, parent: Path) -> str:
@@ -127,6 +135,23 @@ def run_generation(now: datetime | None = None) -> dict[str, Any]:
     }
 
 
+def _sentinel_path(out_dir: Path) -> Path:
+    return out_dir / "salon_board_result.json"
+
+
+def _already_posted_today(out_dir: Path) -> bool:
+    """Return True if today's salon_board_result.json already records success."""
+    sentinel = _sentinel_path(out_dir)
+    if not sentinel.exists():
+        return False
+    try:
+        from src.utils import read_json
+        prev = read_json(sentinel)
+        return bool(prev.get("success"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def run_salon_board(generation: dict[str, Any], mode: str, now: datetime) -> dict[str, Any]:
     """Post the generated content to Salon Board (draft or schedule)."""
     # Lazy import so unit tests don't require Playwright to be installed at module level.
@@ -138,6 +163,19 @@ def run_salon_board(generation: dict[str, Any], mode: str, now: datetime) -> dic
     )
 
     log = logging.getLogger("hpb-blog.main")
+    out_dir = Path(generation["out_dir"])
+
+    # Duplicate-post guard: if today's sentinel already records a success,
+    # skip the Salon Board step. Protects against double-fire (manual dispatch
+    # on a cron-firing day, or a workflow re-run after a partial failure).
+    if _already_posted_today(out_dir) and not _bool_env("ALLOW_REPOST"):
+        log.warning(
+            "Today's salon_board_result.json already records success; skipping repost. "
+            "Set ALLOW_REPOST=true to override.",
+        )
+        from src.utils import read_json
+        return read_json(_sentinel_path(out_dir))
+
     blog = generation["blog"]
     image_path = Path(generation["image_path"])
     poster = get_poster_for_date(now.date())
@@ -160,8 +198,8 @@ def run_salon_board(generation: dict[str, Any], mode: str, now: datetime) -> dic
     else:
         raise ValueError(f"Unknown salon-board mode: {mode!r}")
 
-    out_dir = Path(generation["out_dir"])
-    write_json(out_dir / "salon_board_result.json", result.to_dict())
+    # out_dir was already resolved above for the duplicate-post guard.
+    write_json(_sentinel_path(out_dir), result.to_dict())
     log.info("Salon Board: success=%s final_url=%s", result.success, result.final_url)
     return result.to_dict()
 
