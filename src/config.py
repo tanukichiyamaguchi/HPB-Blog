@@ -55,6 +55,11 @@ THEME_HISTORY_LOOKBACK_DAYS = 30
 CLAUDE_MAX_TOKENS_THEME = 512
 CLAUDE_MAX_TOKENS_BLOG = 4096
 
+# HPB title input has a character cap. Spec says 全角 25 chars; we count every
+# code point as 1 unit (strict upper bound, safe regardless of how HPB counts
+# half-width chars).
+MAX_TITLE_LENGTH = 25
+
 # Canonical salon signature. Always appended to every blog body so the LLM
 # cannot truncate or omit it. Keep wording byte-identical to the README spec.
 SALON_SIGNATURE = (

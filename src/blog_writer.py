@@ -16,6 +16,7 @@ from src.config import (
     BLOG_PROMPT_PATH,
     CLAUDE_MAX_TOKENS_BLOG,
     CLAUDE_MODEL,
+    MAX_TITLE_LENGTH,
     SALON_SIGNATURE,
     SIGNATURE_HORIZONTAL_RULE,
 )
@@ -86,6 +87,41 @@ def _parse_keywords(text: str) -> list[str]:
     return out
 
 
+# Emoji ranges to strip. Covers the Supplementary Multilingual Plane (most modern
+# emoji like 🎉✨💕😊⭐🌸) and the Dingbats block (✂✈✅✨). Intentionally does NOT
+# strip BMP "Miscellaneous Symbols" so allowed symbols are preserved:
+#   ♪ (U+266A), ＊ (U+FF0A), ◯ (U+25EF), ◎ (U+25CE), ★/☆ (U+2605/U+2606).
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FFFF"  # Supplementary plane symbols / emoji
+    "\U00002700-\U000027BF"  # Dingbats
+    "]+"
+)
+
+
+def strip_emoji(text: str) -> str:
+    """Remove emoji glyphs. HPB-allowed symbols (♪ ＊ ^ ◯ ◎) are preserved."""
+    return _EMOJI_RE.sub("", text)
+
+
+# Punctuation we'd rather cut on than mid-word, in priority order.
+_TITLE_CUT_PRIORITY: tuple[str, ...] = ("♪", "！", "!", "。", "、", "・", " ", "　")
+
+
+def enforce_title_length(title: str, max_len: int = MAX_TITLE_LENGTH) -> str:
+    """Ensure title length ≤ max_len, cutting at a natural boundary when possible."""
+    if len(title) <= max_len:
+        return title
+    candidate = title[:max_len]
+    # Try to truncate at a separator past the halfway mark, so we don't return ""
+    half = max(1, max_len // 2)
+    for sep in _TITLE_CUT_PRIORITY:
+        idx = candidate.rfind(sep)
+        if idx >= half:
+            return candidate[: idx + 1].rstrip()
+    return candidate.rstrip()
+
+
 def ensure_signature(body: str) -> str:
     """Strip any partial signature the LLM may have produced and append the canonical one.
 
@@ -106,7 +142,13 @@ def ensure_signature(body: str) -> str:
 
 
 def parse_blog(raw: str) -> BlogPost:
-    """Robustly extract title/keywords/body from the structured Claude output."""
+    """Robustly extract title/keywords/body from the structured Claude output.
+
+    Applies post-processing defenses regardless of LLM compliance:
+      - emoji stripping (HPB displays emoji as garbled text)
+      - title length enforcement (max 25 chars per HPB UI cap)
+      - canonical signature appended at body tail
+    """
     raw = raw.strip()
     sections = _parse_sections(raw)
     title = _normalize_title(sections.get("タイトル", ""))
@@ -116,6 +158,25 @@ def parse_blog(raw: str) -> BlogPost:
     if not body:
         # Fallback: if structure is missing, treat everything after the last header as body
         body = raw
+
+    # Defensive cleanup: strip emoji from both title and body
+    title_stripped = strip_emoji(title)
+    if title_stripped != title:
+        log.warning("Stripped emoji from title: %r → %r", title, title_stripped)
+    title = title_stripped
+
+    body_stripped = strip_emoji(body)
+    if body_stripped != body:
+        log.warning("Stripped emoji from body (%d chars removed)", len(body) - len(body_stripped))
+    body = body_stripped
+
+    # Enforce title length (HPB caps at 25 chars)
+    if len(title) > MAX_TITLE_LENGTH:
+        log.warning(
+            "Title length %d exceeds %d; truncating: %r",
+            len(title), MAX_TITLE_LENGTH, title,
+        )
+        title = enforce_title_length(title)
 
     body = ensure_signature(body)
 

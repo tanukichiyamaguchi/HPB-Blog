@@ -7,11 +7,13 @@ from src.blog_writer import (
     BlogPost,
     _parse_keywords,
     _parse_sections,
+    enforce_title_length,
     ensure_signature,
     generate_blog,
     parse_blog,
+    strip_emoji,
 )
-from src.config import SALON_SIGNATURE
+from src.config import MAX_TITLE_LENGTH, SALON_SIGNATURE
 
 
 SAMPLE_OUTPUT = """---
@@ -129,6 +131,105 @@ def test_generate_blog_rejects_empty_theme():
         generate_blog("")
     with pytest.raises(ValueError):
         generate_blog("   ")
+
+
+def test_strip_emoji_removes_supplementary_plane_emojis():
+    text = "蒲田で眉毛WAX🎉素敵な仕上がり✨💕"
+    out = strip_emoji(text)
+    assert "🎉" not in out
+    assert "✨" not in out
+    assert "💕" not in out
+    assert "蒲田で眉毛WAX素敵な仕上がり" in out
+
+
+def test_strip_emoji_removes_dingbats():
+    text = "梅雨対策✂✈✅にぴったり"
+    out = strip_emoji(text)
+    assert "✂" not in out
+    assert "✈" not in out
+    assert "✅" not in out
+    assert "梅雨対策にぴったり" in out
+
+
+def test_strip_emoji_preserves_allowed_symbols():
+    """User-allowed symbols ♪ ＊ * ^ ◯ ◎ must survive emoji stripping."""
+    text = "蒲田駅西口♪眉毛WAXで美眉◎すっきり◯人気＊おすすめ*^^"
+    out = strip_emoji(text)
+    assert "♪" in out
+    assert "＊" in out
+    assert "*" in out
+    assert "◯" in out
+    assert "◎" in out
+    assert "^^" in out
+    assert out == text  # nothing should have been removed
+
+
+def test_strip_emoji_preserves_japanese_punctuation():
+    text = "「梅雨」の眉対策、〜整え方〜。！？"
+    out = strip_emoji(text)
+    assert out == text
+
+
+def test_enforce_title_length_no_change_when_short():
+    title = "蒲田駅西口♪眉毛WAX"
+    assert enforce_title_length(title) == title
+
+
+def test_enforce_title_length_truncates_to_max():
+    long_title = "梅雨前に整えておきたい！蒲田駅西口で眉毛WAXして崩れ知らずの美眉へ"
+    out = enforce_title_length(long_title)
+    assert len(out) <= MAX_TITLE_LENGTH
+
+
+def test_enforce_title_length_cuts_at_natural_boundary():
+    """If there's a ♪ or ！ past the midpoint, prefer cutting there over mid-word."""
+    title = "蒲田駅西口で眉毛WAX♪崩れ知らずの美眉へ整える"
+    out = enforce_title_length(title, max_len=20)
+    # ♪ at index 12 is past half (10), so we should cut there
+    assert out.endswith("♪")
+    assert len(out) <= 20
+
+
+def test_enforce_title_length_hard_cuts_when_no_separator():
+    title = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほ"
+    out = enforce_title_length(title, max_len=10)
+    assert len(out) <= 10
+
+
+def test_parse_blog_strips_emoji_and_truncates_title():
+    raw = """◆タイトル：
+🎉梅雨前に整えておきたい！蒲田駅西口で眉毛WAXして崩れ知らずの美眉へ✨💕
+
+◆使用キーワード：
+蒲田、眉毛
+
+◆本文：
+本文の内容です。✨気持ちいいですよね♪
+"""
+    post = parse_blog(raw)
+    # Emoji removed
+    assert "🎉" not in post.title
+    assert "✨" not in post.title
+    assert "💕" not in post.title
+    assert "✨" not in post.body
+    # ♪ preserved in body
+    assert "♪" in post.body
+    # Title length enforced
+    assert len(post.title) <= MAX_TITLE_LENGTH
+
+
+def test_parse_blog_keeps_short_clean_title_intact():
+    raw = """◆タイトル：
+蒲田駅西口♪眉毛WAXで美眉
+
+◆使用キーワード：
+蒲田
+
+◆本文：
+本文。
+"""
+    post = parse_blog(raw)
+    assert post.title == "蒲田駅西口♪眉毛WAXで美眉"
 
 
 def test_ensure_signature_appends_when_missing():
