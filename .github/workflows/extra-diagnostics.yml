@@ -259,12 +259,162 @@ jobs:
         run: warp-cli --accept-tos disconnect || true
 
   # ============================================================
+  # Job D: Playwright Firefox / WebKit from US IP
+  # ============================================================
+  # Job A で curl_cffi の safari17_0 と firefox133 が salonboard に
+  # HTTP 200 で通ったことが判明。Akamai は Chrome の TLS フィンガープリントを
+  # 狙い撃ちで遮断している。Playwright を Firefox / WebKit に切り替えれば
+  # 米国IPからの GitHub Actions ランナーで運用可能になる可能性が高い。
+  playwright-firefox-webkit:
+    name: 'D. Playwright Firefox / WebKit (US IP)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Runner location
+        run: |
+          IP=$(curl -s https://api.ipify.org)
+          echo "Public IP: $IP"
+          curl -s "https://ipinfo.io/$IP" | head -8 || true
+
+      - name: Install Playwright with Firefox & WebKit
+        run: |
+          python3 -m pip install --quiet playwright
+          python3 -m playwright install --with-deps firefox webkit 2>&1 | tail -5
+
+      - name: '[D1] Playwright Firefox → salonboard.com'
+        run: |
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+          import time, traceback
+
+          with sync_playwright() as p:
+              browser = p.firefox.launch(
+                  headless=True,
+                  firefox_user_prefs={
+                      "intl.accept_languages": "ja-JP,ja",
+                      "general.useragent.locale": "ja-JP",
+                  },
+              )
+              ctx = browser.new_context(
+                  locale="ja-JP",
+                  timezone_id="Asia/Tokyo",
+                  viewport={"width": 1280, "height": 800},
+                  extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+              )
+              page = ctx.new_page()
+              start = time.time()
+              try:
+                  resp = page.goto(
+                      "https://salonboard.com/login/",
+                      timeout=30000,
+                      wait_until="domcontentloaded",
+                  )
+                  elapsed = time.time() - start
+                  print(f"  ✅ Firefox: HTTP {resp.status}, {elapsed:.2f}s")
+                  print(f"  Final URL : {page.url}")
+                  print(f"  Title     : {page.title()!r}")
+                  content = page.content()
+                  print(f"  Body len  : {len(content)} chars")
+                  hits = [kw for kw in ["ログイン", "パスワード", "サロンボード"] if kw in content]
+                  print(f"  Keywords  : {hits}")
+                  if resp.status < 400 and hits:
+                      print("  🎉 FIREFOX PASSES Akamai check on US IP.")
+                  page.screenshot(path="/tmp/firefox_sb.png", full_page=True)
+              except Exception as e:
+                  elapsed = time.time() - start
+                  print(f"  ❌ Firefox failed after {elapsed:.2f}s: {type(e).__name__}: {e}")
+                  try: page.screenshot(path="/tmp/firefox_sb_error.png", full_page=True)
+                  except Exception: pass
+              finally:
+                  browser.close()
+          PYEOF
+
+      - name: '[D2] Playwright WebKit → salonboard.com'
+        run: |
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+          import time
+
+          with sync_playwright() as p:
+              browser = p.webkit.launch(headless=True)
+              ctx = browser.new_context(
+                  locale="ja-JP",
+                  timezone_id="Asia/Tokyo",
+                  viewport={"width": 1280, "height": 800},
+                  extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+              )
+              page = ctx.new_page()
+              start = time.time()
+              try:
+                  resp = page.goto(
+                      "https://salonboard.com/login/",
+                      timeout=30000,
+                      wait_until="domcontentloaded",
+                  )
+                  elapsed = time.time() - start
+                  print(f"  ✅ WebKit: HTTP {resp.status}, {elapsed:.2f}s")
+                  print(f"  Final URL : {page.url}")
+                  print(f"  Title     : {page.title()!r}")
+                  content = page.content()
+                  print(f"  Body len  : {len(content)} chars")
+                  hits = [kw for kw in ["ログイン", "パスワード", "サロンボード"] if kw in content]
+                  print(f"  Keywords  : {hits}")
+                  if resp.status < 400 and hits:
+                      print("  🎉 WEBKIT PASSES Akamai check on US IP.")
+                  page.screenshot(path="/tmp/webkit_sb.png", full_page=True)
+              except Exception as e:
+                  elapsed = time.time() - start
+                  print(f"  ❌ WebKit failed after {elapsed:.2f}s: {type(e).__name__}: {e}")
+                  try: page.screenshot(path="/tmp/webkit_sb_error.png", full_page=True)
+                  except Exception: pass
+              finally:
+                  browser.close()
+          PYEOF
+
+      - name: '[D3] Confirm form interaction in Firefox (input found?)'
+        run: |
+          # If [D1] passed, try to actually interact with form elements
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+
+          with sync_playwright() as p:
+              browser = p.firefox.launch(headless=True)
+              ctx = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
+              page = ctx.new_page()
+              try:
+                  page.goto("https://salonboard.com/login/", timeout=30000, wait_until="domcontentloaded")
+                  # Look for the actual login form input fields
+                  id_field = page.locator("#idPasswordInputId, input[name='userId'], input[name='loginId']").first
+                  pw_field = page.locator("#idPasswordInputPassword, input[name='password']").first
+                  submit_btn = page.locator("button[type='submit'], input[type='submit']").first
+                  print(f"  ID input visible    : {id_field.is_visible(timeout=5000)}")
+                  print(f"  PW input visible    : {pw_field.is_visible(timeout=5000)}")
+                  print(f"  Submit btn visible  : {submit_btn.is_visible(timeout=5000)}")
+                  print("  🎉 Login form is interactable from Firefox on US IP.")
+              except Exception as e:
+                  print(f"  ⚠️  Form interaction check: {type(e).__name__}: {e}")
+              finally:
+                  browser.close()
+          PYEOF
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-webkit-diagnostic
+          path: |
+            /tmp/firefox_sb.png
+            /tmp/firefox_sb_error.png
+            /tmp/webkit_sb.png
+            /tmp/webkit_sb_error.png
+          if-no-files-found: ignore
+
+  # ============================================================
   # Summary
   # ============================================================
   summary:
     name: 'Summary'
     runs-on: ubuntu-latest
-    needs: [curl-cffi, vpn-gate, cloudflare-warp]
+    needs: [curl-cffi, vpn-gate, cloudflare-warp, playwright-firefox-webkit]
     if: always()
     steps:
       - name: Decision matrix
@@ -272,9 +422,9 @@ jobs:
           echo "================================="
           echo "📊 Decision matrix"
           echo "================================="
-          echo "Outcome  | Means | Next step"
-          echo "---------|-------|----------"
-          echo "[A] HTTP 200 from curl_cffi US-IP   → Akamai checks TLS, NOT geography. Use curl_cffi-based poster, free GH Actions runs."
-          echo "[B] HTTP 200 via VPN Gate JP        → Free JP-IP via OpenVPN works. Wire into daily-blog.yml."
-          echo "[C] HTTP 200 via WARP               → Tokyo CF edge passes. Use WARP in workflow."
-          echo "ALL FAIL                            → Akamai IP+TLS+JS all enforced. Oracle Cloud Tokyo Free remains the only path."
+          echo "Confirmed earlier:"
+          echo "  - curl_cffi safari17_0 / firefox133 → HTTP 200 (Akamai targets Chrome TLS only)"
+          echo ""
+          echo "If [D1] Firefox passes  → 🎉 Migrate Playwright to firefox.launch()"
+          echo "If [D2] WebKit passes   → 🎉 Migrate Playwright to webkit.launch()"
+          echo "If both fail            → Use curl_cffi-based HTTP-only flow (more complex)"
