@@ -1,0 +1,265 @@
+name: Login Bypass Diagnostic
+
+# /CNC/login/doLogin/ が Akamai に silent drop されている問題に対し、
+# まだ試していない代替経路を網羅的に検証する。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bypass:
+    name: 'Login bypass strategies'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install curl_cffi
+        run: pip install --quiet 'curl_cffi>=0.7.0'
+
+      - name: '[1] GET /login_sp/ to discover mobile form action'
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import re, os, json
+
+          ipad_ua = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+                     "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                     "Version/17.5 Mobile/15E148 Safari/604.1")
+
+          # Step A: GET /login_sp/
+          print("=== GET https://salonboard.com/login_sp/ ===")
+          try:
+              r = requests.get(
+                  "https://salonboard.com/login_sp/",
+                  impersonate="safari17_0",
+                  headers={"User-Agent": ipad_ua, "Accept-Language": "ja-JP,ja;q=0.9"},
+                  timeout=15,
+              )
+              print(f"HTTP {r.status_code}, body_len={len(r.text)}")
+              # Extract form action(s)
+              actions = re.findall(r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>', r.text)
+              print(f"All <form action=...> found: {actions}")
+              # Save HTML for inspection
+              with open("login_sp.html", "w", encoding="utf-8") as f:
+                  f.write(r.text)
+              # Extract any URL containing 'login' or 'doLogin'
+              urls = re.findall(r'["\']([^"\']*(?:doLogin|loginPost|login)[^"\']*)["\']', r.text)
+              print(f"Login-related URLs in body: {sorted(set(urls))[:20]}")
+          except Exception as e:
+              print(f"❌ GET failed: {type(e).__name__}: {e}")
+          PYEOF
+
+      - name: '[2] GET /CNC/loginByOauth and other endpoint discovery'
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+
+          paths = [
+              "/CNC/loginByOauth/",
+              "/CNC/mobile/login/",
+              "/CNC/sp/login/",
+              "/CNC/login/doLogin",       # no trailing slash
+              "/CNC/login/dologin/",      # lowercase
+              "/CNC/auth/login/",
+              "/CNC/api/login/",
+              "/api/login/",
+              "/CNC/login/doLoginSp/",
+              "/CNC/loginGuide/",
+          ]
+          for p in paths:
+              url = f"https://salonboard.com{p}"
+              try:
+                  r = requests.get(url, impersonate="firefox133", timeout=10)
+                  print(f"  GET {p:40s} → HTTP {r.status_code} ({len(r.text)}b)")
+              except Exception as e:
+                  print(f"  GET {p:40s} → ❌ {type(e).__name__}")
+          PYEOF
+
+      - name: '[3] POST doLogin with multiple TLS profiles'
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import os
+
+          uid = os.environ["SALON_BOARD_ID"]
+          pw = os.environ["SALON_BOARD_PASSWORD"]
+
+          # First seed Akamai cookies with a GET
+          print("--- Seeding cookies via GET /login/ ---")
+          session = requests.Session()
+          try:
+              r = session.get(
+                  "https://salonboard.com/login/",
+                  impersonate="firefox133",
+                  headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                  timeout=15,
+              )
+              print(f"  GET /login/: {r.status_code}, cookies={list(session.cookies.keys())}")
+          except Exception as e:
+              print(f"  ❌ seed GET failed: {e}")
+              import sys
+              sys.exit(0)
+
+          profiles = ["chrome120", "safari17_0", "safari_ios_17_0", "chrome_android_120", "edge99"]
+          for profile in profiles:
+              print(f"\n--- POST doLogin with impersonate={profile} ---")
+              try:
+                  r = session.post(
+                      "https://salonboard.com/CNC/login/doLogin/",
+                      impersonate=profile,
+                      data={"userId": uid, "password": pw},
+                      headers={
+                          "Origin": "https://salonboard.com",
+                          "Referer": "https://salonboard.com/login/",
+                          "Accept-Language": "ja-JP,ja;q=0.9",
+                          "Content-Type": "application/x-www-form-urlencoded",
+                      },
+                      timeout=10,
+                      allow_redirects=False,
+                  )
+                  print(f"  ✅ HTTP {r.status_code}, Location={r.headers.get('Location', '')!r}")
+              except Exception as e:
+                  print(f"  ❌ {type(e).__name__} after timeout")
+          PYEOF
+
+      - name: '[4] POST doLogin with multipart/form-data and JSON body'
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import os, json
+
+          uid = os.environ["SALON_BOARD_ID"]
+          pw = os.environ["SALON_BOARD_PASSWORD"]
+
+          # Seed cookies
+          session = requests.Session()
+          try:
+              session.get("https://salonboard.com/login/",
+                          impersonate="firefox133",
+                          headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                          timeout=15)
+          except Exception:
+              pass
+
+          # Multipart
+          print("--- POST doLogin as multipart/form-data ---")
+          try:
+              r = session.post(
+                  "https://salonboard.com/CNC/login/doLogin/",
+                  impersonate="firefox133",
+                  files={"userId": (None, uid), "password": (None, pw)},
+                  headers={
+                      "Origin": "https://salonboard.com",
+                      "Referer": "https://salonboard.com/login/",
+                  },
+                  timeout=10,
+                  allow_redirects=False,
+              )
+              print(f"  ✅ HTTP {r.status_code}, Location={r.headers.get('Location', '')!r}")
+          except Exception as e:
+              print(f"  ❌ multipart: {type(e).__name__}")
+
+          # JSON
+          print("\n--- POST doLogin as application/json ---")
+          try:
+              r = session.post(
+                  "https://salonboard.com/CNC/login/doLogin/",
+                  impersonate="firefox133",
+                  json={"userId": uid, "password": pw},
+                  headers={
+                      "Origin": "https://salonboard.com",
+                      "Referer": "https://salonboard.com/login/",
+                  },
+                  timeout=10,
+                  allow_redirects=False,
+              )
+              print(f"  ✅ HTTP {r.status_code}, Location={r.headers.get('Location', '')!r}")
+          except Exception as e:
+              print(f"  ❌ json: {type(e).__name__}")
+          PYEOF
+
+      - name: '[5] Check ats.salonboard.com subdomain'
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+
+          print("=== GET ats.salonboard.com/login?r=sb_login ===")
+          try:
+              r = requests.get(
+                  "https://ats.salonboard.com/login?r=sb_login",
+                  impersonate="firefox133",
+                  headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                  timeout=15,
+              )
+              print(f"HTTP {r.status_code}, body_len={len(r.text)}, final_url={r.url}")
+              with open("ats_login.html", "w", encoding="utf-8") as f:
+                  f.write(r.text[:5000])
+              # Extract URLs
+              import re
+              forms = re.findall(r'<form[^>]*action=["\']([^"\']+)["\']', r.text)
+              print(f"Form actions: {forms}")
+          except Exception as e:
+              print(f"❌ {type(e).__name__}: {e}")
+          PYEOF
+
+      - name: '[6] Try login via ats subdomain'
+        env:
+          SALON_BOARD_ID: ${{ secrets.SALON_BOARD_ID }}
+          SALON_BOARD_PASSWORD: ${{ secrets.SALON_BOARD_PASSWORD }}
+        run: |
+          python3 << 'PYEOF'
+          from curl_cffi import requests
+          import os
+
+          uid = os.environ["SALON_BOARD_ID"]
+          pw = os.environ["SALON_BOARD_PASSWORD"]
+
+          session = requests.Session()
+          print("--- GET ats.salonboard.com/login ---")
+          try:
+              r = session.get("https://ats.salonboard.com/login?r=sb_login",
+                              impersonate="firefox133",
+                              headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+                              timeout=15)
+              print(f"  HTTP {r.status_code}")
+          except Exception as e:
+              print(f"  ❌ {e}")
+              import sys
+              sys.exit(0)
+
+          # Try common login POST URLs on ats
+          paths = ["/login", "/api/login", "/doLogin", "/auth/login", "/login/doLogin"]
+          for p in paths:
+              url = f"https://ats.salonboard.com{p}"
+              try:
+                  r = session.post(url, impersonate="firefox133",
+                                   data={"userId": uid, "password": pw},
+                                   headers={"Accept-Language": "ja-JP,ja;q=0.9",
+                                            "Origin": "https://ats.salonboard.com",
+                                            "Referer": "https://ats.salonboard.com/login?r=sb_login"},
+                                   timeout=10, allow_redirects=False)
+                  print(f"  POST {p:25s} → HTTP {r.status_code}, Loc={r.headers.get('Location','')!r}")
+              except Exception as e:
+                  print(f"  POST {p:25s} → ❌ {type(e).__name__}")
+          PYEOF
+
+      - name: Upload discovery artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bypass-discovery
+          path: |
+            login_sp.html
+            ats_login.html
+          if-no-files-found: ignore
