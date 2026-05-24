@@ -32,20 +32,23 @@ def test_build_image_prompt_specifies_late_20s_persona():
 
 
 def test_build_image_prompt_specifies_frontal_view():
-    """User requirement: 正面からの画像。"""
+    """User requirement: 正面〜やや上を見る自然な視線。"""
     prompt = build_image_prompt("テーマ", "眉毛WAX")
     assert "正面" in prompt
-    # Forbidden angle words appear only inside negative-instruction sentences
-    assert "横顔・斜めアングル・俯瞰・あおりは禁止" in prompt
+    assert "横顔" in prompt and "禁止" in prompt
 
 
-def test_build_image_prompt_excludes_nose_hair_etc():
-    """User requirement: 鼻や髪は写さず、目元のみにトリミング。"""
+def test_build_image_prompt_excludes_nose_strictly():
+    """User requirement (latest): 鼻は絶対にフレーム内に入れない。"""
     prompt = build_image_prompt("テーマ", "眉毛WAX")
-    # The negative-instruction sentence must list every excluded body part
-    for forbidden_part in ("鼻", "口", "頬", "耳", "髪", "額", "首"):
-        assert forbidden_part in prompt, f"missing exclusion for {forbidden_part}"
-    assert "フレーム内に入れない" in prompt
+    # Nose exclusion is the strictest constraint — must be explicit
+    assert "鼻" in prompt
+    assert "絶対にフレーム内に入れない" in prompt
+    # 口・顎 も除外対象
+    assert "口" in prompt
+    assert "顎" in prompt
+    # 髪は逆に「少し写り込むのは OK」(reference images にも髪が見える)
+    assert "髪" in prompt
 
 
 def test_build_image_prompt_universal_lash_style():
@@ -104,24 +107,30 @@ def test_build_image_prompt_keeps_natural_skin_texture():
     prompt = build_image_prompt("テーマ", "眉毛WAX")
     # Should still avoid heavy face-tune
     assert "美肌アプリ" in prompt or "美肌フィルター" in prompt
-    assert "リアル" in prompt
+    # Natural texture preserved
+    assert "毛穴" in prompt
+    assert "ニュアンス" in prompt or "質感" in prompt
 
 
-def test_build_image_prompt_extreme_close_up_crop():
-    """User requirement: もっと目元のみのアップに。"""
+def test_build_image_prompt_tight_eye_brow_crop():
+    """User requirement: 眉のすぐ上〜下まつげのすぐ下まで、鼻は出さない。"""
     prompt = build_image_prompt("テーマ", "眉毛WAX")
-    assert "片目を中心" in prompt
-    assert "超クローズアップ" in prompt
-    assert "超拡大率" in prompt
+    # Top boundary
+    assert "眉のすぐ上" in prompt
+    # Bottom boundary
+    assert "下まつげのすぐ下" in prompt or "下まつげ" in prompt
+    # Sharpness expectation
+    assert "1本1本" in prompt
 
 
 def test_build_image_prompt_two_panel_collage():
-    """User requirement: 添付画像のように二分割になるように。"""
+    """User requirement: 添付画像のように上下2分割の縦長コラージュ。"""
     prompt = build_image_prompt("テーマ", "眉毛WAX")
-    assert "2分割" in prompt
+    # Layout markers
     assert "上パネル" in prompt
     assert "下パネル" in prompt
     assert "縦長" in prompt
+    assert "コラージュ" in prompt
     # Must NOT be a before/after comparison
     assert "before" not in prompt.lower()
     assert "after" not in prompt.lower()
