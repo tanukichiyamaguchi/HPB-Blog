@@ -96,18 +96,23 @@ _BROW_DENSITY_VARIATIONS: tuple[str, ...] = (
 )
 
 
-# Professional model-shoot lighting style — replaces the prior iPhone-amateur look.
-# User wants the reference image aesthetic: bright even pro lighting + sharp closeup,
-# but still realistic (no excessive face-tune / over-smooth retouching).
-_PROFESSIONAL_PHOTO_STYLE = (
-    "モデル撮影用の均一なプロライティング（リングライトまたは大型ソフトボックス）で"
-    "目元と眉が明るくクリアに照らされた、美容雑誌のアイメイク特集ページのような"
-    "魅力的な仕上がり。瞳には小さな catch light（光の反射点）が映り込み、"
-    "肌は陶器のように滑らかに均一に照らされて影が柔らかい。"
-    "プロのマクロレンズ／接写レンズで撮影したような高精細な描写で、"
-    "まつげ1本1本と眉の毛流れまで鮮明に視認できるシャープさを保つ。"
-    "ただし美肌アプリのような不自然な平面的フィルターは避け、"
-    "肌のリアルな質感やニュアンスは残したナチュラルな美しさ"
+# "Skilled friend with an iPhone Pro" aesthetic — high-quality but natural,
+# not studio-staged. The previous "professional studio lighting" wording made
+# images look like commercial ad shots; users want something that looks like
+# a great Instagram post from a salon, taken casually but well.
+_IPHONE_PHOTO_STYLE = (
+    "プロカメラマン並みの腕を持つ友人が iPhone（最新 Pro モデル）で気軽に"
+    "撮影したような、自然で親しみやすい高画質写真。"
+    "自然光またはやわらかい屋内光（窓際の柔らかい光、または天井のディフューズ"
+    "された照明）の下で、目元と眉が明るく程よくクリアに見える。"
+    "瞳には自然な光の反射（catch light）が小さく映り込み、肌は明るく整って"
+    "見えるが、美肌アプリのような完全に平面化した不自然さは避け、毛穴・微細な"
+    "質感・自然な肌のニュアンスは適度に残す。"
+    "iPhone Pro の computational photography 由来の、暗部の自然な持ち上げ、"
+    "発色の良さ、シャープすぎない自然な解像感。"
+    "まつげ1本1本と眉の毛流れまで視認できる接写品質を保ちつつ、"
+    "スタジオの硬い均一ライティングや雑誌広告のような完璧すぎる仕上がりではなく、"
+    "「サロンの SNS や Instagram で見かけるような素敵な日常写真」のリアルさ"
 )
 
 
@@ -135,7 +140,8 @@ def build_image_prompt(
     Diversity: eye type / skin / brow density are sampled randomly per call so
     consecutive generations depict different women.
 
-    Photo style: amateur iPhone aesthetic (no studio-grade polish).
+    Photo style: high-quality iPhone Pro shot by a skilled photographer
+    (natural light, not studio-staged).
 
     Pass ``rng`` (a ``random.Random``) for deterministic sampling in tests.
     """
@@ -165,7 +171,7 @@ def build_image_prompt(
         f"- 眉：{_BASE_BROW_STYLE}（眉の毛量ベース：{brow_base}）。\n"
         f"【今回のメニュー強調】{menu_hint}。\n"
         f"テーマ：{theme}。\n"
-        f"撮影スタイル：{_PROFESSIONAL_PHOTO_STYLE}。\n"
+        f"撮影スタイル：{_IPHONE_PHOTO_STYLE}。\n"
         "背景：白〜オフホワイトの無地でシンプル、被写体（目元）を引き立てる清潔な背景。\n"
         "メイク：控えめでナチュラル、肌は素肌感のある美しい質感（過度な美肌フィルターは"
         "避けるが、サロンで仕上げた整った美しさは表現）。"

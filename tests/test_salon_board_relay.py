@@ -13,7 +13,7 @@ from src.salon_board_relay import (
     POSTER_ROTATION,
     STAFF_IDS,
     PostResult,
-    _format_body_html,
+    _format_body_for_salon_board,
     _hidden_field,
     _parse_form_tokens,
     _parse_login_state,
@@ -89,27 +89,31 @@ def test_parse_login_state_empty_when_absent():
     assert _parse_login_state("<html>no js</html>") == ("", "")
 
 
-# ---- body HTML formatter ----
+# ---- body formatter (plain text — Salon Board escapes HTML in blogContents1) ----
 
 
-def test_format_body_html_wraps_each_paragraph():
-    out = _format_body_html("para1\n\npara2")
-    assert out == "<p>para1</p>\n<p>para2</p>"
+def test_format_body_passes_through_plain_text_with_paragraphs():
+    out = _format_body_for_salon_board("para1\n\npara2")
+    assert out == "para1\n\npara2"
 
 
-def test_format_body_html_converts_inline_newlines_to_br():
-    out = _format_body_html("line1\nline2")
-    assert out == "<p>line1<br />line2</p>"
+def test_format_body_preserves_inline_newlines():
+    out = _format_body_for_salon_board("line1\nline2")
+    assert out == "line1\nline2"
 
 
-def test_format_body_html_returns_empty_for_blank_input():
-    assert _format_body_html("") == ""
-    assert _format_body_html("   \n  \n") == ""
+def test_format_body_returns_empty_for_blank_input():
+    assert _format_body_for_salon_board("") == ""
+    assert _format_body_for_salon_board("   \n  \n") == ""
 
 
-def test_format_body_html_handles_crlf():
-    out = _format_body_html("a\r\n\r\nb")
-    assert out == "<p>a</p>\n<p>b</p>"
+def test_format_body_normalises_crlf_to_lf():
+    assert _format_body_for_salon_board("a\r\nb") == "a\nb"
+    assert _format_body_for_salon_board("a\rb") == "a\nb"
+
+
+def test_format_body_strips_surrounding_whitespace():
+    assert _format_body_for_salon_board("\n\nhello\n\n") == "hello"
 
 
 # ---- poster rotation ----

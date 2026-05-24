@@ -875,20 +875,18 @@ class PostResult:
         }
 
 
-def _format_body_html(text: str) -> str:
-    """Convert plain-text blog body into the HTML that Salon Board's blogContents1 expects.
+def _format_body_for_salon_board(text: str) -> str:
+    """Normalize the blog body for the Salon Board ``blogContents1`` field.
 
-    nicEdit (the in-page WYSIWYG) emits ``<p>...</p>`` per paragraph with
-    ``<br />`` for soft line breaks. We mirror that so posts render the same
-    whether typed in the UI or submitted via this relay.
+    Salon Board treats blogContents1 as **plain text** and escapes HTML tags
+    when rendering posts (we tested this in production — sending ``<p>...</p>``
+    showed the literal tags in the rendered post). So we strip any HTML wrapping
+    and just normalize line endings; Salon Board's display layer handles the
+    paragraph rendering itself.
     """
     if not text or not text.strip():
         return ""
-    normalised = text.replace("\r\n", "\n").replace("\r", "\n")
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", normalised) if p.strip()]
-    return "\n".join(
-        f"<p>{p.replace(chr(10), '<br />')}</p>" for p in paragraphs
-    )
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _require_credentials() -> tuple[str, str]:
@@ -955,7 +953,7 @@ def post_blog_scheduled(
 
     staff_id = STAFF_IDS[poster]
     category_code = BLOG_CATEGORY_CODES[category]
-    body_html = _format_body_html(body)
+    body_text = _format_body_for_salon_board(body)
     images = [Path(image_path)] if image_path else None
 
     log.info(
@@ -971,7 +969,7 @@ def post_blog_scheduled(
         final_url = submit_blog(
             relay,
             title=title,
-            body=body_html,
+            body=body_text,
             staff_id=staff_id,
             reserve_dt=publish_at,
             category_code=category_code,

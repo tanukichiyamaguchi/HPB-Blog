@@ -84,17 +84,19 @@ def test_build_image_prompt_lash_lift_maintains_base_cluster():
     assert "基本通り維持" in prompt
 
 
-def test_build_image_prompt_uses_professional_model_lighting():
-    """User requirement (latest): モデル撮影用ライトでライトアップ。"""
+def test_build_image_prompt_uses_skilled_iphone_aesthetic():
+    """User requirement (latest): 写真撮影が上手な人が iPhone で撮影した品質。
+
+    Pulls back from studio-grade staging while keeping macro-sharp closeup
+    detail — should look like a great salon Instagram post, not a magazine ad.
+    """
     prompt = build_image_prompt("テーマ", "眉毛WAX")
-    assert "モデル撮影" in prompt
-    assert "プロライティング" in prompt
-    assert "美容雑誌" in prompt
-    # Old amateur/iPhone language must be gone
-    assert "iPhone" not in prompt
-    assert "素人" not in prompt
-    assert "スマートフォン" not in prompt
-    assert "Instagram" not in prompt
+    # New aesthetic markers
+    assert "iPhone" in prompt
+    assert "自然" in prompt  # 自然光 / 自然な…
+    # Studio-staged wording must be gone
+    assert "モデル撮影用の均一なプロライティング" not in prompt
+    assert "美容雑誌のアイメイク特集ページのような" not in prompt
 
 
 def test_build_image_prompt_keeps_natural_skin_texture():
