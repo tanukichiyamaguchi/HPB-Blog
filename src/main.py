@@ -190,9 +190,10 @@ def run_salon_board(generation: dict[str, Any], now: datetime) -> dict[str, Any]
     image_path = Path(generation["image_path"])
     poster = get_poster_for_date(now.date())
     publish_at = compute_next_publish_dt(now)
+    theme_result: ThemeResult = generation["theme_result"]
     log.info(
-        "=== Salon Board: SCHEDULE mode (poster=%s, cat=%s, publish_at=%s) ===",
-        poster, DEFAULT_CATEGORY_LABEL, publish_at.isoformat(),
+        "=== Salon Board: SCHEDULE mode (poster=%s, cat=%s, menu=%s, publish_at=%s) ===",
+        poster, DEFAULT_CATEGORY_LABEL, theme_result.menu_focus, publish_at.isoformat(),
     )
 
     result = post_blog_scheduled(
@@ -202,6 +203,8 @@ def run_salon_board(generation: dict[str, Any], now: datetime) -> dict[str, Any]
         publish_at=publish_at,
         poster=poster,
         category=DEFAULT_CATEGORY_LABEL,
+        menu_focus=theme_result.menu_focus,
+        theme=theme_result.theme,
     )
 
     write_json(_sentinel_path(out_dir), result.to_dict())
