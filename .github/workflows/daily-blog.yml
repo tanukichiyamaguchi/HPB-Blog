@@ -2,9 +2,11 @@ name: Daily Blog Auto-Post (Production)
 
 on:
   schedule:
-    # Runs daily at 13:15 UTC == 22:15 JST. The Salon Board side will publish
-    # the scheduled post at next-day 08:15 JST, so this leaves plenty of buffer.
-    - cron: "15 13 * * *"
+    # Runs daily at 23:00 UTC == 08:00 JST (next-day).
+    # The reservation is created for *tomorrow*'s 3 slots (08:15 / 12:15 / 19:15
+    # JST), so this cron fires ~24h+ ahead of the earliest publish time and
+    # well within Salon Board's ~14-day reservation window.
+    - cron: "0 23 * * *"
   workflow_dispatch: {}
 
 permissions:
