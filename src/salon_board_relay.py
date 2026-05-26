@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -214,6 +215,10 @@ SALON_BOARD_BLOG_CONFIRM_URL = "https://salonboard.com/KLP/blog/blog/confirm"
 # Discovered: the "登録・反映予約する" button (id="reflect") JS posts here with just
 # 2 fields: the new TOKEN from the confirm response + the unchanged storeIdForMultipleTabCheck.
 SALON_BOARD_BLOG_REFLECT_URL = "https://salonboard.com/KLP/blog/blog/doReflectComplete"
+# AJAX coupon list endpoint. The form's クーポン選択 modal fetches this lazily
+# the first time it's opened. Response is an HTML <ul class="couponListArea">
+# (not JSON). Append a cache-buster `_=<unix_ms>` to match jQuery's convention.
+SALON_BOARD_COUPON_LIST_URL = "https://salonboard.com/KLP/ajax/netCouponList"
 # KLP top page. Visiting this after login establishes the KLP-area session state
 # that some KLP/blog endpoints expect (Salon Board / Struts session is partly
 # constructed by visiting top-level area pages, not just by login).
@@ -281,14 +286,20 @@ _USERID_RE = re.compile(r"""['"]?userid['"]?\s*:\s*['"]([^'"]*)['"]""")
 def _parse_login_state(body: str) -> tuple[str, str]:
     """Return (storeid, userid) extracted from sc_data inline JS in the body.
 
-    Either is empty string if not found / not authenticated.
+    Salon Board may emit multiple sc_data blocks on a page. We iterate through
+    all matches and return the *first non-empty* value, so a placeholder
+    ``storeid:''`` earlier in the document doesn't mask the real value
+    appearing later.
+
+    Either field is "" if no non-empty match is found.
     """
-    sid = _STOREID_RE.search(body)
-    uid = _USERID_RE.search(body)
-    return (
-        sid.group(1).strip() if sid else "",
-        uid.group(1).strip() if uid else "",
-    )
+    def _first_nonempty(rx: re.Pattern[str]) -> str:
+        for m in rx.finditer(body):
+            v = m.group(1).strip()
+            if v:
+                return v
+        return ""
+    return _first_nonempty(_STOREID_RE), _first_nonempty(_USERID_RE)
 
 
 def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
@@ -352,13 +363,20 @@ def login(relay: SalonBoardRelay, user_id: str, password: str) -> RelayResponse:
                 storeid, "<masked>" if userid else "<empty>",
             )
             return r
-        # storeid 空 = ログインフォーム再表示 (認証失敗)
+        # storeid 空 = ログインフォーム再表示 / エラー画面 / Akamai challenge 等。
+        # 真因究明のため body を dump (SALON_BOARD_DEBUG_DUMP_DIR が設定されてい
+        # れば) してから raise。
+        _dump_debug_body("login_failed", r.body_text)
+        # title 取得 + body 先頭を error message に含める
+        title_match = re.search(r"<title>([^<]+)</title>", r.body_text)
+        title = title_match.group(1).strip() if title_match else "(no title)"
         body_preview = r.body_text[:400].replace("\n", " ")
         raise RuntimeError(
-            f"Login failed: HTTP 200 but storeid empty (credentials likely wrong). "
-            f"Body preview: {body_preview}"
+            f"Login failed: HTTP 200 but storeid empty. "
+            f"Response title={title!r}. Body preview: {body_preview}"
         )
 
+    _dump_debug_body("login_unexpected_status", r.body_text)
     raise RuntimeError(f"Login: unexpected status {r.status}")
 
 
@@ -594,6 +612,167 @@ def _dump_debug_body(label: str, body: str) -> str | None:
         return None
 
 
+# ----- coupon list (for attaching the most relevant coupon to a post) -----
+
+
+@dataclass
+class CouponInfo:
+    """Parsed coupon entry from the netCouponList HTML response."""
+    coupon_id: str          # e.g. "CP00000012316921"
+    title: str              # human-visible title
+    target: str             # "新規" / "全員" / "再来" (couponLabelCT01/CT02/CT03)
+
+
+# Maps the CSS class suffix to the target audience label, used as a fallback
+# when the visible label text can't be extracted from the cell.
+_COUPON_TARGET_BY_CLASS = {
+    "CT01": "全員",
+    "CT02": "新規",
+    "CT03": "再来",
+}
+
+# Each coupon row is wrapped in an <li>; we split on `<li>` and parse each chunk.
+_COUPON_LI_RE = re.compile(r"<li\b[^>]*>(.+?)</li>", re.DOTALL | re.IGNORECASE)
+_COUPON_ID_RE = re.compile(
+    r'<input[^>]*type="hidden"[^>]*value="(CP\d+)"', re.IGNORECASE,
+)
+_COUPON_TITLE_RE = re.compile(
+    r'<p[^>]*class="[^"]*couponText[^"]*"[^>]*>(.+?)</p>',
+    re.IGNORECASE | re.DOTALL,
+)
+_COUPON_LABEL_RE = re.compile(
+    r'<td[^>]*class="[^"]*couponLabelC(T0[123])[^"]*"[^>]*>([^<]*)</td>',
+    re.IGNORECASE,
+)
+
+
+def _strip_html(s: str) -> str:
+    """Drop HTML tags and entities for a clean text title."""
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("&amp;", "&").replace("&nbsp;", " ")
+    return " ".join(s.split())
+
+
+def _parse_coupons(body: str) -> list[CouponInfo]:
+    """Parse the <ul class="couponListArea"> HTML into a list of CouponInfo.
+
+    Silently skips items missing required fields rather than raising — the
+    coupon list is best-effort: a single malformed row shouldn't break posting.
+    """
+    out: list[CouponInfo] = []
+    for li_body in _COUPON_LI_RE.findall(body):
+        id_m = _COUPON_ID_RE.search(li_body)
+        title_m = _COUPON_TITLE_RE.search(li_body)
+        if not id_m or not title_m:
+            continue
+        # Target label: prefer the visible text, fall back to class suffix
+        target = ""
+        label_m = _COUPON_LABEL_RE.search(li_body)
+        if label_m:
+            target = label_m.group(2).strip() or _COUPON_TARGET_BY_CLASS.get(
+                label_m.group(1).upper(), ""
+            )
+        out.append(CouponInfo(
+            coupon_id=id_m.group(1),
+            title=_strip_html(title_m.group(1)),
+            target=target,
+        ))
+    return out
+
+
+def fetch_coupons(relay: SalonBoardRelay) -> list[CouponInfo]:
+    """Fetch and parse the salon's coupon list via the relay (best-effort).
+
+    Returns an empty list on any failure so the caller can decide whether to
+    proceed without a coupon. Logs the failure but does not raise.
+    """
+    cache_buster = int(time.time() * 1000)
+    url = f"{SALON_BOARD_COUPON_LIST_URL}?_={cache_buster}"
+    log.info("Fetch coupons: GET %s", url)
+    try:
+        r = relay.get(
+            url,
+            headers={
+                "Accept": "*/*",
+                "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": SALON_BOARD_BLOG_NEW_URL,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Coupon fetch failed: %s", e)
+        return []
+    if r.status != 200:
+        log.warning("Coupon fetch returned HTTP %d", r.status)
+        return []
+    coupons = _parse_coupons(r.body_text)
+    log.info("  Parsed %d coupons", len(coupons))
+    return coupons
+
+
+# Target priority for theme-matched coupons: 新規 first (blog is acquisition
+# marketing → reward new customers), then 全員, then 再来.
+_COUPON_TARGET_PRIORITY = ("新規", "全員", "再来")
+
+
+def select_coupon_for_theme(
+    coupons: list[CouponInfo],
+    menu_focus: str,
+    *,
+    theme: str = "",
+) -> CouponInfo | None:
+    """Pick the most relevant coupon for a blog with the given menu focus.
+
+    Algorithm:
+      1. **Direct match**: coupons whose title contains ``menu_focus`` as a
+         substring (case-insensitive for ASCII). Within matches, prefer 新規,
+         then 全員, then 再来.
+      2. **Theme keyword fallback**: if step 1 found nothing and ``theme`` is
+         provided, try matching distinctive theme keywords against titles.
+      3. **General fallback**: first 全員 coupon (broadly applicable).
+      4. **Last resort**: first coupon in the list.
+
+    Returns ``None`` if the coupon list is empty.
+    """
+    if not coupons:
+        return None
+
+    def _contains_ci(haystack: str, needle: str) -> bool:
+        if not needle:
+            return False
+        return needle.lower() in haystack.lower()
+
+    def _pick_by_priority(candidates: list[CouponInfo]) -> CouponInfo | None:
+        if not candidates:
+            return None
+        for target in _COUPON_TARGET_PRIORITY:
+            for c in candidates:
+                if c.target == target:
+                    return c
+        return candidates[0]
+
+    # Step 1: menu_focus substring match
+    matches = [c for c in coupons if _contains_ci(c.title, menu_focus)]
+    if matches:
+        return _pick_by_priority(matches)
+
+    # Step 2: theme keyword fallback (any single Japanese kw of len>=2 from theme)
+    if theme:
+        # Pull katakana/kanji runs of length ≥ 2 as candidate keywords
+        keywords = re.findall(r"[゠-ヿ一-鿿]{2,}", theme)
+        for kw in keywords:
+            kw_matches = [c for c in coupons if kw in c.title]
+            if kw_matches:
+                return _pick_by_priority(kw_matches)
+
+    # Step 3: first 全員 coupon
+    for c in coupons:
+        if c.target == "全員":
+            return c
+    # Step 4: anything
+    return coupons[0]
+
+
 def submit_blog(
     relay: SalonBoardRelay,
     *,
@@ -604,6 +783,7 @@ def submit_blog(
     category_code: str = "KL03",
     image_paths: list[Path | str] | None = None,
     unpublish_staff_ids: list[str] | None = None,
+    coupon_id: str | None = None,
 ) -> str:
     """ブログ記事を Salon Board に投稿する（予約投稿）.
 
@@ -728,15 +908,25 @@ def submit_blog(
         "unPublishStaff": unpublish_field,
         "blogCategoryCd": category_code,
         "title": title,
+    }
+    # couponId is conditional — Salon Board ignores empty values for it but
+    # we mirror the browser flow which simply omits the field when no coupon
+    # is attached. Inserted between `title` and `rsvTokoFlg` to match the
+    # field order observed in DevTools (server doesn't care but it makes
+    # captured payloads easier to diff).
+    if coupon_id:
+        confirm_data["couponId"] = coupon_id
+    confirm_data.update({
         "rsvTokoFlg": "1",
         "rsvTokoDate": rsv_date,
         "rsvTokoTime": rsv_time,
-    }
+    })
 
     log.info(
-        "Submit blog [3/4]: POST %s (title=%r, staff=%s, cat=%s, rsv=%s %s, imgs=%d)",
+        "Submit blog [3/4]: POST %s (title=%r, staff=%s, cat=%s, rsv=%s %s, imgs=%d, coupon=%s)",
         SALON_BOARD_BLOG_CONFIRM_URL,
-        title[:30], staff_id, category_code, rsv_date, rsv_time, len(image_urls),
+        title[:30], staff_id, category_code, rsv_date, rsv_time,
+        len(image_urls), coupon_id or "<none>",
     )
     r = relay.post(
         SALON_BOARD_BLOG_CONFIRM_URL,
@@ -843,8 +1033,28 @@ DEFAULT_CATEGORY_LABEL = "おすすめメニュー"
 
 
 def get_poster_for_date(d: date) -> str:
-    """Return the rotating poster name for the given date (deterministic)."""
+    """Return the rotating poster name for the given date (deterministic).
+
+    Kept for backwards compatibility. New multi-slot code should call
+    ``get_poster_for_date_and_slot`` instead.
+    """
     return POSTER_ROTATION[d.toordinal() % len(POSTER_ROTATION)]
+
+
+def get_poster_for_date_and_slot(d: date, slot_index: int) -> str:
+    """Return the poster for the given date + slot index (deterministic).
+
+    With 3 posts per day and 3 staff, this assigns each staff to a different
+    slot every day while shifting the starting position day-by-day so no
+    single person is "always the morning poster":
+
+      Day N   (ord=K):    morning=staff[K%3]   noon=staff[(K+1)%3]   evening=staff[(K+2)%3]
+      Day N+1 (ord=K+1):  morning=staff[(K+1)%3] noon=staff[(K+2)%3]   evening=staff[K%3]
+      Day N+2 (ord=K+2):  morning=staff[(K+2)%3] noon=staff[K%3]      evening=staff[(K+1)%3]
+
+    Over a 3-day cycle every staff covers every slot, evenly.
+    """
+    return POSTER_ROTATION[(d.toordinal() + slot_index) % len(POSTER_ROTATION)]
 
 
 @dataclass
@@ -862,20 +1072,18 @@ class PostResult:
         }
 
 
-def _format_body_html(text: str) -> str:
-    """Convert plain-text blog body into the HTML that Salon Board's blogContents1 expects.
+def _format_body_for_salon_board(text: str) -> str:
+    """Normalize the blog body for the Salon Board ``blogContents1`` field.
 
-    nicEdit (the in-page WYSIWYG) emits ``<p>...</p>`` per paragraph with
-    ``<br />`` for soft line breaks. We mirror that so posts render the same
-    whether typed in the UI or submitted via this relay.
+    Salon Board treats blogContents1 as **plain text** and escapes HTML tags
+    when rendering posts (we tested this in production — sending ``<p>...</p>``
+    showed the literal tags in the rendered post). So we strip any HTML wrapping
+    and just normalize line endings; Salon Board's display layer handles the
+    paragraph rendering itself.
     """
     if not text or not text.strip():
         return ""
-    normalised = text.replace("\r\n", "\n").replace("\r", "\n")
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", normalised) if p.strip()]
-    return "\n".join(
-        f"<p>{p.replace(chr(10), '<br />')}</p>" for p in paragraphs
-    )
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _require_credentials() -> tuple[str, str]:
@@ -897,6 +1105,8 @@ def post_blog_scheduled(
     *,
     poster: str,
     category: str = DEFAULT_CATEGORY_LABEL,
+    menu_focus: str = "",
+    theme: str = "",
 ) -> PostResult:
     """Login + submit one scheduled blog post via the PHP relay.
 
@@ -905,9 +1115,16 @@ def post_blog_scheduled(
     ``SALON_BOARD_PASSWORD``, ``RELAY_URL``, ``RELAY_SECRET``) and wraps
     the full ``login → submit_blog`` flow in a ``PostResult``.
 
+    When ``menu_focus`` is provided, the relay also fetches the salon's coupon
+    list and attaches the best-matching coupon (theme-priority: substring
+    match against the menu focus, with 新規 > 全員 > 再来 preference).
+    Coupon fetch/select failure is non-fatal — the post still goes through
+    with no coupon attached.
+
     Args:
         title: Blog title (Salon Board enforces ≤ 50 chars / ≤ 全角25文字).
-        body: Plain-text body. Gets converted to nicEdit-style HTML.
+        body: Plain-text body. Salon Board escapes HTML on display, so don't
+            pre-wrap in tags.
         image_path: Optional image to upload as the post's image. ``None``
             posts without an image.
         publish_at: Scheduled publication datetime (JST). Must be within
@@ -915,6 +1132,11 @@ def post_blog_scheduled(
             03:15–08:00.
         poster: Author display name; must be in ``STAFF_IDS``.
         category: Category label; must be in ``BLOG_CATEGORY_CODES``.
+        menu_focus: The blog's primary menu (e.g. "眉毛WAX", "まつげパーマ").
+            Used for theme-matched coupon selection. Empty string skips
+            coupon attachment entirely.
+        theme: The blog's theme text. Used as a fallback for coupon selection
+            when no coupon title contains ``menu_focus`` directly.
 
     Returns:
         ``PostResult``. On failure, ``error`` carries the underlying message
@@ -942,27 +1164,53 @@ def post_blog_scheduled(
 
     staff_id = STAFF_IDS[poster]
     category_code = BLOG_CATEGORY_CODES[category]
-    body_html = _format_body_html(body)
+    body_text = _format_body_for_salon_board(body)
     images = [Path(image_path)] if image_path else None
 
     log.info(
-        "post_blog_scheduled: poster=%s (%s), cat=%s (%s), publish_at=%s, img=%s",
+        "post_blog_scheduled: poster=%s (%s), cat=%s (%s), publish_at=%s, img=%s, menu=%r",
         poster, staff_id, category, category_code,
         publish_at.isoformat(),
         Path(image_path).name if image_path else "<none>",
+        menu_focus,
     )
 
     relay = SalonBoardRelay(relay_url, relay_secret)
     try:
         login(relay, user_id, password)
+
+        # Coupon selection (best-effort — failure is non-fatal so the blog
+        # still gets posted, just without a coupon attached).
+        coupon_id: str | None = None
+        if menu_focus:
+            try:
+                coupons = fetch_coupons(relay)
+                selected = select_coupon_for_theme(
+                    coupons, menu_focus, theme=theme,
+                )
+                if selected:
+                    coupon_id = selected.coupon_id
+                    log.info(
+                        "Selected coupon: %s [%s] %s",
+                        selected.coupon_id, selected.target, selected.title[:60],
+                    )
+                else:
+                    log.warning(
+                        "No coupon matched menu_focus=%r; posting without coupon",
+                        menu_focus,
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning("Coupon selection failed (non-fatal): %s", e)
+
         final_url = submit_blog(
             relay,
             title=title,
-            body=body_html,
+            body=body_text,
             staff_id=staff_id,
             reserve_dt=publish_at,
             category_code=category_code,
             image_paths=images,
+            coupon_id=coupon_id,
         )
         return PostResult(success=True, final_url=final_url)
     except (RuntimeError, ValueError, FileNotFoundError) as e:

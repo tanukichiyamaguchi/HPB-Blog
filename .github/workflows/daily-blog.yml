@@ -2,9 +2,11 @@ name: Daily Blog Auto-Post (Production)
 
 on:
   schedule:
-    # Runs daily at 13:15 UTC == 22:15 JST. The Salon Board side will publish
-    # the scheduled post at next-day 08:15 JST, so this leaves plenty of buffer.
-    - cron: "15 13 * * *"
+    # Runs daily at 23:00 UTC == 08:00 JST (next-day).
+    # The reservation is created for *tomorrow*'s 3 slots (08:15 / 12:15 / 19:15
+    # JST), so this cron fires ~24h+ ahead of the earliest publish time and
+    # well within Salon Board's ~14-day reservation window.
+    - cron: "0 23 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -24,7 +26,9 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       vars.ENABLE_DAILY_CRON == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 3 posts/day (morning/noon/evening) ≈ 3× generation + 3× relay post.
+    # Single-post pipeline takes ~3 min, so 3 slots safely fit under 40 min.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,6 +73,10 @@ jobs:
           UPDATE_THEME_HISTORY: "true"
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PYTHONUNBUFFERED: "1"
+          # On any relay-side failure (login form re-shown, KPCL error, etc.)
+          # the relay client dumps the failing HTML response here so we can
+          # see exactly what Salon Board returned without rerunning.
+          SALON_BOARD_DEBUG_DUMP_DIR: ${{ github.workspace }}/debug-dumps
         run: python -m src.main
 
       - name: Commit theme history
@@ -84,11 +92,33 @@ jobs:
             echo "No changes to theme_history.json"
           fi
 
+      - name: Show debug dumps in log (on failure)
+        if: failure()
+        run: |
+          set +e
+          DIR="${{ github.workspace }}/debug-dumps"
+          if [ ! -d "$DIR" ]; then
+            echo "No debug-dumps directory"
+            exit 0
+          fi
+          for f in "$DIR"/*.html "$DIR"/*.txt; do
+            [ -e "$f" ] || continue
+            echo ""
+            echo "================================================================"
+            echo "=== $f ($(wc -c < "$f") bytes)"
+            echo "================================================================"
+            cat "$f"
+            echo ""
+            echo "=== EOF $f ==="
+          done
+
       - name: Upload artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: daily-blog-failure-${{ github.run_id }}
-          path: output/
+          path: |
+            output/
+            debug-dumps/
           if-no-files-found: warn
           retention-days: 14
