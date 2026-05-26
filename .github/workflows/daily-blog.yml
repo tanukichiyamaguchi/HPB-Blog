@@ -24,7 +24,9 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       vars.ENABLE_DAILY_CRON == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 3 posts/day (morning/noon/evening) ≈ 3× generation + 3× relay post.
+    # Single-post pipeline takes ~3 min, so 3 slots safely fit under 40 min.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4

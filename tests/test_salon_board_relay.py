@@ -21,6 +21,7 @@ from src.salon_board_relay import (
     _parse_login_state,
     _select_options,
     get_poster_for_date,
+    get_poster_for_date_and_slot,
     post_blog_scheduled,
     select_coupon_for_theme,
 )
@@ -382,3 +383,42 @@ def test_coupon_info_dataclass_fields():
     assert c.coupon_id == "CP000"
     assert c.title == "t"
     assert c.target == "新規"
+
+
+# ---- multi-slot poster rotation ----
+
+
+def test_get_poster_for_date_and_slot_uses_all_three_staff_per_day():
+    """Each day, all 3 slots should map to 3 distinct staff."""
+    d = date(2026, 5, 24)
+    assigned = {get_poster_for_date_and_slot(d, i) for i in range(3)}
+    assert assigned == set(POSTER_ROTATION)
+
+
+def test_get_poster_for_date_and_slot_shifts_day_by_day():
+    """Day-to-day rotation: no staff is always 'morning'."""
+    d1 = date(2026, 5, 24)
+    d2 = date(2026, 5, 25)
+    d3 = date(2026, 5, 26)
+    mornings = {
+        get_poster_for_date_and_slot(d, 0)
+        for d in (d1, d2, d3)
+    }
+    # Over 3 consecutive days, every staff covers the morning slot once.
+    assert mornings == set(POSTER_ROTATION)
+
+
+def test_get_poster_for_date_and_slot_deterministic():
+    d = date(2026, 5, 24)
+    for slot_index in range(3):
+        assert (
+            get_poster_for_date_and_slot(d, slot_index)
+            == get_poster_for_date_and_slot(d, slot_index)
+        )
+
+
+def test_get_poster_for_date_and_slot_matches_legacy_single_slot():
+    """slot_index 0 should match the legacy single-poster-per-day function."""
+    for ordinal in range(1, 50):
+        d = date.fromordinal(ordinal)
+        assert get_poster_for_date_and_slot(d, 0) == get_poster_for_date(d)

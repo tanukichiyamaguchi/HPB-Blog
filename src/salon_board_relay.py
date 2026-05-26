@@ -1033,8 +1033,28 @@ DEFAULT_CATEGORY_LABEL = "おすすめメニュー"
 
 
 def get_poster_for_date(d: date) -> str:
-    """Return the rotating poster name for the given date (deterministic)."""
+    """Return the rotating poster name for the given date (deterministic).
+
+    Kept for backwards compatibility. New multi-slot code should call
+    ``get_poster_for_date_and_slot`` instead.
+    """
     return POSTER_ROTATION[d.toordinal() % len(POSTER_ROTATION)]
+
+
+def get_poster_for_date_and_slot(d: date, slot_index: int) -> str:
+    """Return the poster for the given date + slot index (deterministic).
+
+    With 3 posts per day and 3 staff, this assigns each staff to a different
+    slot every day while shifting the starting position day-by-day so no
+    single person is "always the morning poster":
+
+      Day N   (ord=K):    morning=staff[K%3]   noon=staff[(K+1)%3]   evening=staff[(K+2)%3]
+      Day N+1 (ord=K+1):  morning=staff[(K+1)%3] noon=staff[(K+2)%3]   evening=staff[K%3]
+      Day N+2 (ord=K+2):  morning=staff[(K+2)%3] noon=staff[K%3]      evening=staff[(K+1)%3]
+
+    Over a 3-day cycle every staff covers every slot, evenly.
+    """
+    return POSTER_ROTATION[(d.toordinal() + slot_index) % len(POSTER_ROTATION)]
 
 
 @dataclass
