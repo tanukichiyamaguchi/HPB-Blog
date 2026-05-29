@@ -19,12 +19,6 @@ concurrency:
 jobs:
   post:
     name: Generate + Schedule post + Notify
-    # Safety guard: scheduled triggers only fire when the repo-level variable
-    # `ENABLE_DAILY_CRON` is set to "true" via Settings → Variables → Actions.
-    # Manual workflow_dispatch always works.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      vars.ENABLE_DAILY_CRON == 'true'
     runs-on: ubuntu-latest
     # 3 posts/day (morning/noon/evening) ≈ 3× generation + 3× relay post.
     # Single-post pipeline takes ~3 min, so 3 slots safely fit under 40 min.
